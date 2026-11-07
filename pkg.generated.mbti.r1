@@ -1,0 +1,131 @@
+// Generated using `moon info`, DON'T EDIT IT
+package "hnlyxiaobing/camera2"
+
+import {
+  "moonbitlang/core/debug",
+}
+
+// Values
+pub fn enumerate_cameras(JavaVMPtr) -> Array[CameraInfo] raise CameraError
+
+pub fn mb_camera2_acquire_frame(ImageReaderRaw, FixedArray[Byte], Int32, Int32) -> Int32
+
+pub fn mb_camera2_clear_frame_callback(ImageReaderRaw) -> Unit
+
+pub fn mb_camera2_close(CameraHandleRaw, ImageReaderRaw) -> Unit
+
+pub fn mb_camera2_create_reader(CameraHandleRaw, Int32, Int32, Int32) -> ImageReaderRaw
+
+pub fn mb_camera2_init(JavaVMPtr) -> Int32
+
+pub fn mb_camera2_open(Bytes, Int32, Int32, Int32) -> CameraHandleRaw
+
+pub fn mb_camera2_release_frame(ImageReaderRaw) -> Unit
+
+pub fn mb_camera2_set_frame_callback(ImageReaderRaw, FuncRef[(() -> Unit) -> Unit], () -> Unit) -> Int32
+
+pub fn mb_camera2_start_preview(CameraHandleRaw, ImageReaderRaw) -> Int32
+
+// Errors
+#derive(@debug.Debug)
+pub(all) suberror CameraError {
+  PermissionDenied(String)
+  CameraNotFound(String)
+  OpenFailed(Int32, String)
+  PreviewFailed(Int32, String)
+  UnsupportedSize(Int32, Int32)
+  UnsupportedFormat(String)
+  BufferAcquireFailed(Int32)
+  BufferPoolExhausted(Int32)
+  JniThreadNotAttached(String)
+  AlreadyOpen
+  AlreadyClosed
+  VendorQuirk(String)
+}
+pub fn CameraError::to_repr(Self) -> @debug.Repr
+
+// Types and methods
+pub(all) struct Camera {
+  handle : CameraHandleRaw
+  reader : ImageReaderRaw
+  config : CameraConfig
+  state : CameraState
+  owner_thread_id : UInt64
+}
+pub fn Camera::clear_on_frame(Self) -> Unit raise CameraError
+pub fn Camera::close(Self) -> Unit raise CameraError
+pub fn Camera::grab_yuv(Self, Int32) -> YuvFrame raise CameraError
+pub fn Camera::on_frame(Self, (YuvFrame) -> Unit) -> Unit raise CameraError
+pub fn Camera::open(JavaVMPtr, CameraConfig) -> Self raise CameraError
+pub fn Camera::start_preview(Self) -> Unit raise CameraError
+
+pub(all) struct CameraConfig {
+  camera_id : String
+  size : FrameSize
+  max_inflight_buffers : Int32
+  rotation_degrees : Int32
+  mirror_x : Bool
+}
+
+#external
+pub type CameraHandleRaw
+
+pub(all) struct CameraInfo {
+  id : String
+  facing : Facing
+  supported_sizes : Array[FrameSize]
+  supports_yuv420888 : Bool
+}
+
+pub(all) enum CameraState {
+  Closed
+  Opening
+  Open
+  Previewing
+  Failed
+}
+
+pub(all) enum Facing {
+  Front
+  Back
+  External
+}
+
+pub(all) struct FrameSize {
+  width : Int32
+  height : Int32
+}
+
+#external
+pub type ImageReaderRaw
+
+#external
+pub type JNIEnvPtr
+
+#external
+pub type JObjectRef
+
+#external
+pub type JavaVMPtr
+
+pub(all) struct YuvFrame {
+  width : Int32
+  height : Int32
+  planes : Array[YuvPlane]
+  timestamp_ns : UInt64
+}
+
+pub(all) struct YuvPlane {
+  data : Bytes
+  row_stride : Int32
+  pixel_stride : Int32
+}
+
+// Type aliases
+pub type FrameCallback = (YuvFrame) -> Unit
+
+// Traits
+pub(open) trait FrameSource {
+  fn grab_yuv(Self) -> YuvFrame raise CameraError
+  fn close(Self) -> Unit raise CameraError
+}
