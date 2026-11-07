@@ -3,6 +3,7 @@
 **Android Camera2 的 JNI 封装 —— 权限、打开、预览 Surface、ImageReader 取 YUV 与关闭的完整相机生命周期。**
 
 > 状态：**R1.5 实现轮完成（2026-11-07）**。全部导出接口已实现，`moon build` / `moon test` 全绿（21 测试，`0068` 清零）。本轮自带**桌面 C stub**（`stub/camera2_stub.c`）模拟 JavaVM/ImageReader/相机会话；**真实 JNI / Java 样板 / ajni / 设备取帧留待 R2**（open-questions E4）。
+> **冻结前 P0 整改（R2 准备轮）已落实**：`FrameSource` 方法集冻结（`grab_yuv(Self)`，trait 层无超时参数，超时策略由具体帧源实现自行定义）· `CameraError` 追认 `pub(all) suberror` · `CameraState` 收紧为 `Open` 单分支 · 9 个 `mb_camera2_*` shim 移出公开 API（包私有，私有实现 ABI）· `close` 幂等措辞统一为「不会二次释放，重复调用返回明确错误」。门禁 `moon clean` / `moon check --deny-warn` / `moon build` / `moon test` / `moon fmt --check` 全绿。
 > `preferred_target` 本轮由 `wasm` 改为 `native`（唯一配置改动，理由见 ADR-0007）。
 
 ## 定位与为什么存在
@@ -23,8 +24,8 @@
 
 ## 依赖
 
-- **本轮零依赖、零 shim 实现**；独立 `moon.mod`，`moon check` 独立通过。
-- 后续轮：`Nanaloveyuki/ajni@0.3.6`（Apache-2.0，双向 checked JNI + Android host bridge）、Java 侧约 200 行 Camera2 样板、`native-stub` C 文件。**本轮未引入**——`ajni` 为 0.x 且作者自述 "Windows/macOS desktop ABI support is not claimed"，需按 ADR-0010 门槛评估。
+- **零外部依赖**；独立 `moon.mod`，`moon check --deny-warn` 独立通过。shim 实现仅为**项目内** `stub/camera2_stub.c` 桌面 stub（9 个 `mb_camera2_*` 为包私有 ABI，非公共 API），**未链接/下载任何外部库**。
+- 后续轮：`Nanaloveyuki/ajni@0.3.6`（Apache-2.0，双向 checked JNI + Android host bridge）、Java 侧约 200 行 Camera2 样板、真实 `native-stub` C 文件。**均未引入**——`ajni` 为 0.x 且作者自述 "Windows/macOS desktop ABI support is not claimed"，需按 ADR-0010 门槛评估。
 
 ## 平台与许可风险
 
@@ -36,18 +37,18 @@
 ## 测试与验收
 
 - **测试策略**：设备取 720p YUV 帧；缓冲池耗尽 / 超时注入；回调线程归属断言（不得在回调内直接 JNI）；权限拒绝 / 设备不存在 / 尺寸不支持路径；`moon test --enable-coverage`。
-- **验收标准**（实现轮）：在红米电视与外接 UVC 摄像头上取到 720p YUV 帧；`close` 幂等；每帧都被归还。
+- **验收标准**（实现轮）：在红米电视与外接 UVC 摄像头上取到 720p YUV 帧；`close` **不会二次释放，重复调用返回明确错误（`AlreadyClosed`）**；每帧都被归还。
 - **R1.5 实测（桌面 stub）**：`moon build` ✅ / `moon test` ✅ 21/21（全链路、状态机、池耗尽、回调 set/clear 成对、stride 描述、错误映射、解析校验）；设备取帧验收留待 R2。
 
 ## 当前状态 / 本轮产物
 
 | 项 | 状态 |
 |---|---|
-| `camera2.mbt` + `internal.mbt`：5 个 `#external` 句柄、9 个 `extern "C"` shim、公开 API ×7 全部实现（状态机 / 错误映射 / YUV 校验） | ✅ |
+| `camera2.mbt` + `internal.mbt`：5 个 `#external` 句柄、9 个**包私有** `extern "C"` shim（私有实现 ABI，非公共 API）、公开 API ×7 全部实现（状态守卫 / 错误映射 / YUV 校验） | ✅ |
 | `stub/camera2_stub.c` 桌面 stub（假设备枚举、可配置帧序列、缓冲池、`#owned` 闭包成对持有/释放、投递线程回调） | ✅ |
-| `camera2_wbtest.mbt` / `camera2_test.mbt` 测试 ×21 | ✅ |
-| `pkg.generated.mbti` API 快照（与 API.md 一致；可见性纠错 2 处见报告） | ✅ |
-| `moon build` / `moon test` / `moon fmt --check` / `moon check` | ✅ 全绿（0068 清零） |
+| `camera2_wbtest.mbt` / `camera2_test.mbt` 测试 ×21（黑盒不直接调用 shim） | ✅ |
+| `pkg.generated.mbti` API 快照（工具链 `rr_moon_pkg` 已自动同步至 P0 后公开面：9 个 shim 移除、`CameraState` 收紧为 `Open`；本子代理未跑 `moon info`，待主控终审） | ✅ |
+| `moon clean` / `moon check --deny-warn` / `moon build` / `moon test` / `moon fmt --check` | ✅ 全绿（0068 清零） |
 | Java Camera2 样板 / 真实 JNI / ajni 依赖 / 设备取帧 | ❌ R2（open-questions E4） |
 
 ## 本轮顺序说明

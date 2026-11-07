@@ -1,6 +1,6 @@
 # camera2 · 设计契约（DESIGN.md）
 
-> Round-1 / 2026-11-06 ｜ 状态：架构与声明可评审，无 Java 样板、无 JNI 调用、无取帧逻辑
+> Round-1.5 实现轮 + **冻结前 P0 整改（R2 准备轮）** ｜ 状态：MoonBit 层 API 全部实现（桌面 C stub 双路径）；无 Java 样板、无真实 JNI 调用、无设备取帧（留待 R2）
 
 ## 1. 分层位置与职责
 
@@ -11,9 +11,9 @@ L3 感知绑定层的**帧源 JNI 封装**。职责：相机生命周期 + 取 Y
 ```
 Java Camera2 / NDK camera2ndk
       ▲ JNI
-mb_camera2_*  extern "C" shim（9 个，本轮只有声明）
+mb_camera2_*  extern "C" shim（9 个，**包私有 ABI，非公共 API**；本轮为项目内桌面 stub）
       ▲
-Camera::{open,start_preview,grab_yuv,on_frame,close}   ← declare
+Camera::{open,start_preview,grab_yuv,on_frame,close}   ← 已实现（MoonBit 层公开 API）
       │
       ▼  camera2::YuvFrame
 组合根 ──(Wire 适配)──► yuv::YuvFrame ──► pose
@@ -29,10 +29,10 @@ Camera::{open,start_preview,grab_yuv,on_frame,close}   ← declare
 | `Camera { handle, reader, config, state, owner_thread_id }` | MoonBit 侧包装值，记录 owner 线程与状态机 |
 | `YuvFrame` / `YuvPlane` | 中性帧值类型（含 row_stride / pixel_stride） |
 | `CameraConfig` / `CameraInfo` / `FrameSize` / `Facing` | 打开配置与能力摘要 |
-| `CameraState` | Closed / Opening / Open / Previewing / Failed |
-| `CameraError` | 11 个错误构造 |
+| `CameraState` | **`Open` 单分支**（冻结前 P0 决策 5：删除未被实际代码路径使用的 `Closed`/`Opening`/`Previewing`/`Failed`，不补齐状态机） |
+| `CameraError` | **`pub(all) suberror`**（决策 4 追认），12 个错误构造 |
 | `FrameCallback = (YuvFrame) -> Unit` | MoonBit 侧回调类型别名 |
-| `FrameSource` trait | `grab_yuv` / `close`，供组合根替换帧源 |
+| `FrameSource` trait | `grab_yuv` / `close`，供组合根替换帧源；**方法集已冻结（决策 3 方案 A）：`grab_yuv(Self)` 无超时参数，超时策略由具体帧源实现自行定义** |
 
 ## 4. 错误模型
 
@@ -49,7 +49,7 @@ Camera::{open,start_preview,grab_yuv,on_frame,close}   ← declare
 | `#owned` 帧回调闭包 | `mb_camera2_set_frame_callback` | `mb_camera2_clear_frame_callback` / `close` | C 侧 `moonbit_decref`；成对注销 |
 | `JavaVM*` | `mb_camera2_init` | 进程级 | 只缓存 VM，不缓存 JNIEnv |
 
-`Camera::close` 幂等，重复调用返回 `AlreadyClosed`。
+`Camera::close` **不会二次释放，重复调用返回明确错误（`AlreadyClosed`）**；未 open / 已 close 的会话由会话存活守卫直接拒绝。
 
 ## 6. 线程 / 并发边界（ADR-0009，硬约束）
 
@@ -63,14 +63,15 @@ Camera::{open,start_preview,grab_yuv,on_frame,close}   ← declare
 
 - `preferred_target = "native"`（本轮调整）；Windows native 需 MSVC；LLVM 后端无 FFI。
 - Android：Java Camera2 全版本；NDK `ACameraManager_*` / `AImageReader` 要求 **API 24+**；`AIMAGE_FORMAT_YUV_420_888` 三平面 Y/U/V，Y 的 pixelStride=1，U/V 共享 rowStride/pixelStride。
-- 后续依赖：`ajni@0.3.6`、Java 样板、`native-stub` C 文件（本轮未引入）。
+- 后续依赖：`ajni@0.3.6`、Java 样板、真实 JNI `native-stub` C 文件（**均未引入**，留待 R2）；
+  本轮 shim 实现仅为项目内 `stub/camera2_stub.c` 桌面 stub，**未链接/下载任何外部库**。
 
 ## 8. 外部类型 / 句柄 / 回调签名 / 所有权规则
 
 | 类别 | 声明 | 规则 |
 |---|---|---|
 | 外部类型 | 5 个 `#external pub type` | C `void*`；MoonBit 不引用计数；**永不跨模块传递** |
-| 外部函数 | 9 个 `pub extern "C" fn mb_camera2_* = "…"` | 由 Java 侧 + `native-stub` 提供 |
+| 外部函数 | 9 个 `extern "C" fn mb_camera2_* = "…"`（**包私有，私有实现 ABI、非公共 API**；冻结前 P0 决策 6 移出公开 API） | 由 Java 侧 + `native-stub`（R2）或项目内桌面 stub（本轮）提供 |
 | 回调签名 | `mb_camera2_set_frame_callback(reader, cb : FuncRef[(() -> Unit) -> Unit], closure : () -> Unit) -> Int` | `FuncRef` 必须**无捕获**；`closure` 用 `#owned(closure)`，C 侧长期持有，注销时 `moonbit_decref` |
 | `#borrow` | `mb_camera2_open(camera_id)`、`mb_camera2_acquire_frame(dst)` | MoonBit 保留缓冲所有权，C 侧只读/填充，不 decref |
 | 状态存放 | JavaVM / global ref / attach 状态 / per-thread data | 全部在 C shim 或 `#external` 句柄中，**不装进 MoonBit 闭包** |
@@ -85,10 +86,10 @@ Camera::{open,start_preview,grab_yuv,on_frame,close}   ← declare
 
 | 层次 | 内容 |
 |---|---|
-| 黑盒 | 设备取 720p YUV 帧（红米电视 + 外接 UVC）；`close` 幂等 |
+| 黑盒 | 设备取 720p YUV 帧（红米电视 + 外接 UVC）；`close` **不会二次释放，重复调用返回明确错误** |
 | 白盒 | stride 非紧凑样本读取；缓冲池耗尽 / 超时注入；回调线程归属断言 |
 | 错误路径 | 权限拒绝、设备不存在、尺寸/格式不支持、JNI 线程未 attach |
-| 门禁 | `moon fmt --check` / `moon check`（本轮不加 `--deny-warn`） |
+| 门禁 | 四道门禁统一口径：`moon check --deny-warn` / `moon build` / `moon test` / `moon fmt --check`（另加 `moon clean`），冻结前 P0 实测全绿 |
 
 ## 11. 验收标准（实现轮）
 
@@ -102,7 +103,12 @@ Camera::{open,start_preview,grab_yuv,on_frame,close}   ← declare
 
 ## 13. 当前状态与 TODO
 
-`camera2.mbt` 已写入 5 个 `#external` 句柄、9 个 shim 声明、值类型、错误模型与 7 个 `declare` API，公开 API 有 `///` 文档注释与 `TODO(实现轮)`。**无 Java 样板、无 C shim、无业务逻辑**。
+`camera2.mbt` / `internal.mbt` 已写入 5 个 `#external` 句柄、9 个**包私有** shim、值类型、
+错误模型与全部 MoonBit 层 API 实现（状态守卫 / 错误映射 / YUV 解析校验）；公开 API 有 `///` 文档注释。
+**冻结前 P0（R2 准备轮）已落实**：决策 3（`FrameSource` 方法集冻结、trait 层无超时参数）、
+决策 4（`CameraError` 追认 `pub(all) suberror`）、决策 5（`CameraState` 收紧为 `Open`）、
+决策 6（9 个 shim 移出公开 API）、决策 8（close 幂等措辞统一）。
+**仍无** Java 样板、真实 JNI、设备取帧（R2 / open-questions E4）。
 
 ## References
 

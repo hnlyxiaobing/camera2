@@ -35,13 +35,12 @@ pub type CameraHandleRaw
 pub type ImageReaderRaw
 
 ///|
-/// 相机状态机。
+/// 相机状态机（**冻结前 P0 决策 5 收紧**：删除未被实际代码路径使用的
+/// `Closed` / `Opening` / `Previewing` / `Failed` 分支，只保留实际构造的
+/// `Open`——`Camera::open` 是唯一写入点，`state` 由 C 侧会话注册表裁决存活，
+/// 不补齐状态机）。
 pub(all) enum CameraState {
-  Closed
-  Opening
   Open
-  Previewing
-  Failed
 }
 
 ///|
@@ -95,7 +94,9 @@ pub(all) struct CameraConfig {
 }
 
 ///|
-/// MoonBit 侧相机包装值；`handle` 为 C 侧裸指针，`state` 用于禁止重复 open/close。
+/// MoonBit 侧相机包装值；`handle` 为 C 侧裸指针。
+/// `state` 为打开状态快照（冻结前 P0 决策 5 后仅 `Open`）；重复 open/close 的存活
+/// 裁决由 C 侧会话注册表（`ensure_session`）完成，不依赖该字段的分支。
 pub(all) struct Camera {
   handle : CameraHandleRaw
   reader : ImageReaderRaw
@@ -105,7 +106,8 @@ pub(all) struct Camera {
 }
 
 ///|
-/// 相机错误模型（`pub(all)`：组合根可替换帧源需在包外构造/抛出，ADR-0004）。
+/// 相机错误模型（**冻结前 P0 决策 4 追认**：`pub(all) suberror`——
+/// 组合根可替换帧源需在包外构造/抛出，ADR-0004）。
 #derive(Debug)
 pub(all) suberror CameraError {
   PermissionDenied(String)
@@ -132,26 +134,35 @@ pub type FrameCallback = (YuvFrame) -> Unit
 ///|
 /// 帧源契约；`pose` / `yuv` 不依赖本库，组合根决定是否注入相机或文件帧源。
 /// `pub(open)`：供包外实现（文件帧源 / RTSP / 桌面摄像头），ADR-0004 可替换性。
+///
+/// **方法集已冻结（冻结前 P0 决策 3，方案 A）**：
+/// - `grab_yuv(Self) -> YuvFrame raise CameraError` —— **接口层不提供超时参数**；
+///   超时策略由具体帧源实现自行定义（如 `Camera::grab_yuv(self, timeout_ms)`、
+///   文件帧源可无限等待）。冻结后给 trait 方法加参数即破坏性变更。
+/// - `close(Self) -> Unit raise CameraError` —— **不会二次释放，重复调用返回明确错误**。
 pub(open) trait FrameSource {
   fn grab_yuv(Self) -> YuvFrame raise CameraError
   fn close(Self) -> Unit raise CameraError
 }
 
 ///|
-/// ---- 外部 C shim 声明 ----
+/// ---- 外部 C shim 声明（**包私有，非公共 API**；冻结前 P0 决策 6）----
 /// 符号由 `stub/camera2_stub.c`（桌面 stub，本轮）提供；
 /// R2 起由 Java 侧 + 真实 JNI `native-stub` 提供同名符号。
+/// 可见性：9 个 `mb_camera2_*` 均为**私有实现 ABI**（不再出现在公开快照），
+/// MoonBit 层只经 `Camera::{open,start_preview,grab_yuv,on_frame,clear_on_frame,close}`
+/// 与 `enumerate_cameras` 调用；符号名与签名不变，R2 对接无需改 ABI。
 /// ABI：Int→int32_t、UInt64→uint64_t、Unit→void、Bytes/FixedArray[Byte]→uint8_t*、
 /// #external→void*、FuncRef→函数指针、`() -> Unit` 闭包→MoonBit 对象指针。
 
 ///|
 /// 进程级初始化：缓存 `JavaVM*`，不缓存 `JNIEnv*`。必须在任何 open 之前调用一次。
-pub extern "C" fn mb_camera2_init(vm : JavaVMPtr) -> Int32 = "mb_camera2_init"
+extern "C" fn mb_camera2_init(vm : JavaVMPtr) -> Int32 = "mb_camera2_init"
 
 ///|
 /// 打开相机；`camera_id` 为 `#borrow`，C 侧只读取。
 #borrow(camera_id)
-pub extern "C" fn mb_camera2_open(
+extern "C" fn mb_camera2_open(
   camera_id : Bytes,
   width : Int32,
   height : Int32,
@@ -160,7 +171,7 @@ pub extern "C" fn mb_camera2_open(
 
 ///|
 /// 创建 ImageReader（YUV_420_888），返回独立句柄。
-pub extern "C" fn mb_camera2_create_reader(
+extern "C" fn mb_camera2_create_reader(
   camera : CameraHandleRaw,
   width : Int32,
   height : Int32,
@@ -169,7 +180,7 @@ pub extern "C" fn mb_camera2_create_reader(
 
 ///|
 /// 启动重复预览请求。
-pub extern "C" fn mb_camera2_start_preview(
+extern "C" fn mb_camera2_start_preview(
   camera : CameraHandleRaw,
   reader : ImageReaderRaw,
 ) -> Int32 = "mb_camera2_start_preview"
@@ -178,7 +189,7 @@ pub extern "C" fn mb_camera2_start_preview(
 /// 同步取一帧；`dst` 由 C 侧填充为「3 段 plane + stride 头」的原始缓冲。
 /// `#borrow` 表示 MoonBit 保留缓冲所有权，C 侧不 decref。
 #borrow(dst)
-pub extern "C" fn mb_camera2_acquire_frame(
+extern "C" fn mb_camera2_acquire_frame(
   reader : ImageReaderRaw,
   dst : FixedArray[Byte],
   capacity : Int32,
@@ -187,14 +198,14 @@ pub extern "C" fn mb_camera2_acquire_frame(
 
 ///|
 /// 归还 Image 缓冲。必须在读取完 plane 字节后调用，否则缓冲池耗尽。
-pub extern "C" fn mb_camera2_release_frame(reader : ImageReaderRaw) -> Unit = "mb_camera2_release_frame"
+extern "C" fn mb_camera2_release_frame(reader : ImageReaderRaw) -> Unit = "mb_camera2_release_frame"
 
 ///|
 /// 注册帧回调。`closure` 为 `#owned`：C 侧长期持有 MoonBit 闭包，
 /// 注销时须由 shim 执行 `moonbit_decref`；`cb` 为无捕获 `FuncRef` 适配器。
 /// 回调在相机投递线程触发，**不得**在其中直接使用 JNI session。
 #owned(closure)
-pub extern "C" fn mb_camera2_set_frame_callback(
+extern "C" fn mb_camera2_set_frame_callback(
   reader : ImageReaderRaw,
   cb : FuncRef[(() -> Unit) -> Unit],
   closure : () -> Unit,
@@ -202,13 +213,12 @@ pub extern "C" fn mb_camera2_set_frame_callback(
 
 ///|
 /// 注销帧回调并释放 `#owned` 持有的闭包。
-pub extern "C" fn mb_camera2_clear_frame_callback(
-  reader : ImageReaderRaw,
-) -> Unit = "mb_camera2_clear_frame_callback"
+extern "C" fn mb_camera2_clear_frame_callback(reader : ImageReaderRaw) -> Unit = "mb_camera2_clear_frame_callback"
 
 ///|
-/// 关闭并释放 reader + camera 句柄（唯一释放点，且只能一次）。
-pub extern "C" fn mb_camera2_close(
+/// 关闭并释放 reader + camera 句柄（C 侧唯一释放点，且只能调用一次；
+/// MoonBit 层保证重复 close 不会二次调用本函数，见 `Camera::close`）。
+extern "C" fn mb_camera2_close(
   camera : CameraHandleRaw,
   reader : ImageReaderRaw,
 ) -> Unit = "mb_camera2_close"
@@ -361,9 +371,11 @@ pub fn Camera::clear_on_frame(self : Camera) -> Unit raise CameraError {
 }
 
 ///|
-/// 关闭相机并释放全部 C 句柄（唯一释放点，且只能一次）：
+/// 关闭相机并释放全部 C 句柄（C 侧唯一释放点）：
 /// 先注销回调（释放 `#owned` 闭包），再释放 reader + camera。
-/// 重复调用报 `AlreadyClosed`（不重复释放）。
+/// **不会二次释放，重复调用返回明确错误（`AlreadyClosed`）**——
+/// 已关闭（或未 open）的会话再调 `close` 由会话存活守卫直接拒绝，
+/// 不会再次触碰 `mb_camera2_close`。
 pub fn Camera::close(self : Camera) -> Unit raise CameraError {
   ensure_session(self.handle, self.reader)
   mb_camera2_clear_frame_callback(self.reader)

@@ -1,0 +1,117 @@
+# ============================================================================
+# WP-F · 模块级 CI workflow 模板（native 目标模块用）
+#
+# 由 .workbuddy/wp-f-gen-ci.ps1 展开到 4 个 native 模块的 .github/workflows/ci.yml。
+# 模块是独立 git 仓库，workflow 必须放在模块内 .github/workflows/ 才会被 GitHub Actions 触发。
+# 根目录 .github/workflows/ci.yml 只是规范/汇总模板：本仓库根目录不是 git 仓库，不会被执行。
+#
+# 四道门禁（顺序执行，任一步非 0 即整 job 失败）：
+#   1. moon check --deny-warn
+#   2. moon build
+#   3. moon test
+#   4. moon fmt --check
+# （可选 moon clean：仅清理，continue-on-error，不参与判定）
+#
+# 工具链钉死（根目录 VERSION-LOCK.md）：
+#   moon    0.1.20261104
+#   moonc   v0.10.20+65efd5b93
+#   moonrun 0.1.20261104
+#   core    0.10.20+65efd5b93（以 ~/.moon/lib/core/moon.mod 为准）
+#
+# 依赖策略（ADR-0010）：
+#   - 禁止无版本 `moon update`：`moon update --help` 实测只有 --target-dir/-q/-v/--trace/--dry-run，
+#     没有任何锁定版本的参数，因此 CI 中一律不出现 `moon update`。
+#   - 依赖只按各模块 moon.mod 中已钉死的版本声明（例：bobzhang/zip@0.1.2）由 check/build 自动同步。
+#   - 如确需显式预取：`moon fetch <author>/<name>@<version> --no-update`（钉死版本且不刷新 registry 元数据）。
+#   - 不用 `moon build --frozen`：全新 checkout 没有本地依赖缓存，--frozen 会直接失败。
+#   - 版本安装：优先 `unix.sh <版本>` 钉死安装；若 CDN 拒绝版本化产物（2026-11-07 实测 403），
+#     回退安装 latest，并由下一步的版本断言**强制**校验——断言不过即失败，锁不会静默漂移。
+# ============================================================================
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  MOON_VERSION_LOCKED: "0.1.20261104"
+  MOONC_VERSION_LOCKED: "v0.10.20+65efd5b93"
+  MOONRUN_VERSION_LOCKED: "0.1.20261104"
+  CORE_VERSION_LOCKED: "0.10.20+65efd5b93"
+
+jobs:
+  four-gates:
+    name: four-gates (camera2)
+    runs-on: ubuntu-latest
+    # 本模块 preferred_target = "native"：build/test 走 native 后端，链接项目内 C stub
+    # （stub 例外，真实库对接留 R2，按门禁分阶段解禁，见 ADR-0007）。
+    # CI runner 是 ubuntu-latest（用系统 cc 链接），该路径 [仍需实测]；Windows/MSVC x86_64
+    # 主机上的同序实跑证据见根目录 .workbuddy/wp-f-ci-local-run.txt（[已复验-本地等价]，
+    # 那是本机等价实跑，不是 GitHub Actions 已跑通）。
+    steps:
+      - name: Checkout camera2
+        uses: actions/checkout@v5
+
+      - name: Install MoonBit toolchain (pinned ${{ env.MOON_VERSION_LOCKED }})
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p "$HOME/.moon/tmp"
+          if ! curl -fsSL https://cli.moonbitlang.com/install/unix.sh -o "$HOME/.moon/tmp/install.sh"; then
+            echo "::error::cannot download https://cli.moonbitlang.com/install/unix.sh"
+            exit 1
+          fi
+          if bash "$HOME/.moon/tmp/install.sh" "$MOON_VERSION_LOCKED"; then
+            echo "pinned install OK: moon $MOON_VERSION_LOCKED"
+          else
+            echo "::warning::pinned install of moon $MOON_VERSION_LOCKED failed (cli.moonbitlang.com versioned artifacts returned HTTP 403 when probed on 2026-11-07; only latest/nightly were reachable). Falling back to 'latest' - the next step asserts the locked versions and FAILS on any drift."
+            bash "$HOME/.moon/tmp/install.sh" || { echo "::error::fallback install failed"; exit 1; }
+          fi
+          echo "$HOME/.moon/bin" >> "$GITHUB_PATH"
+
+      - name: Assert locked toolchain versions (moon / moonc / moonrun / core)
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$(moon version --all)"
+          echo "$out"
+          fail=0
+          grep -qF "moon $MOON_VERSION_LOCKED" <<<"$out" || { echo "::error::moon drift: expected $MOON_VERSION_LOCKED"; fail=1; }
+          grep -qF "moonc $MOONC_VERSION_LOCKED" <<<"$out" || { echo "::error::moonc drift: expected $MOONC_VERSION_LOCKED"; fail=1; }
+          grep -qF "moonrun $MOONRUN_VERSION_LOCKED" <<<"$out" || { echo "::error::moonrun drift: expected $MOONRUN_VERSION_LOCKED"; fail=1; }
+          core_mod="$HOME/.moon/lib/core/moon.mod"
+          if [[ -f "$core_mod" ]]; then
+            echo "--- $core_mod ---"
+            grep -E '^(name|version) *=' "$core_mod" || true
+            grep -qF "version = \"$CORE_VERSION_LOCKED\"" "$core_mod" || { echo "::error::moonbitlang/core drift: expected $CORE_VERSION_LOCKED"; fail=1; }
+          else
+            echo "::error::missing $core_mod (core not installed)"
+            fail=1
+          fi
+          exit $fail
+
+      # ---- 四道门禁：顺序执行，任一非 0 即失败 ----
+      - name: "Gate 1/4 · moon check --deny-warn"
+        shell: bash
+        run: moon check --deny-warn
+
+      - name: "Gate 2/4 · moon build"
+        shell: bash
+        run: moon build
+
+      - name: "Gate 3/4 · moon test"
+        shell: bash
+        run: moon test
+
+      - name: "Gate 4/4 · moon fmt --check"
+        shell: bash
+        run: moon fmt --check
+
+      - name: "Optional · moon clean (not a gate)"
+        shell: bash
+        continue-on-error: true
+        run: moon clean

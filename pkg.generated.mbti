@@ -8,24 +8,6 @@ import {
 // Values
 pub fn enumerate_cameras(JavaVMPtr) -> Array[CameraInfo] raise CameraError
 
-pub fn mb_camera2_acquire_frame(ImageReaderRaw, FixedArray[Byte], Int32, Int32) -> Int32
-
-pub fn mb_camera2_clear_frame_callback(ImageReaderRaw) -> Unit
-
-pub fn mb_camera2_close(CameraHandleRaw, ImageReaderRaw) -> Unit
-
-pub fn mb_camera2_create_reader(CameraHandleRaw, Int32, Int32, Int32) -> ImageReaderRaw
-
-pub fn mb_camera2_init(JavaVMPtr) -> Int32
-
-pub fn mb_camera2_open(Bytes, Int32, Int32, Int32) -> CameraHandleRaw
-
-pub fn mb_camera2_release_frame(ImageReaderRaw) -> Unit
-
-pub fn mb_camera2_set_frame_callback(ImageReaderRaw, FuncRef[(() -> Unit) -> Unit], () -> Unit) -> Int32
-
-pub fn mb_camera2_start_preview(CameraHandleRaw, ImageReaderRaw) -> Int32
-
 // Errors
 #derive(@debug.Debug)
 pub(all) suberror CameraError {
@@ -78,11 +60,7 @@ pub(all) struct CameraInfo {
 }
 
 pub(all) enum CameraState {
-  Closed
-  Opening
   Open
-  Previewing
-  Failed
 }
 
 pub(all) enum Facing {

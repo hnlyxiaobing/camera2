@@ -1,4 +1,11 @@
 # Reference: https://docs.github.com/en/copilot/how-tos/use-copilot-agents/coding-agent/customize-the-agent-environment
+#
+# WP-F 修订（R2 准备轮）：
+#   1) 安装 MoonBit 由「无版本 latest」改为「钉死 0.1.20261104 + 版本断言」；
+#   2) 删除无版本的 `moon update`（`moon update --help` 实测只有 --target-dir/-q/-v/--trace/--dry-run，
+#      没有任何锁定版本的参数，不满足本轮「禁用无版本 moon update」要求）；
+#      依赖改为按 moon.mod 中钉死的版本声明（例 bobzhang/zip@0.1.2）由 build 自动同步获取；
+#   3) 真正的四道门禁（check --deny-warn → build → test → fmt --check）在同目录 ci.yml。
 name: "Copilot Setup Steps"
 
 # Automatically run the setup steps when they are changed to allow for easy validation, and
@@ -20,22 +27,40 @@ jobs:
     # Set the permissions to the lowest permissions possible needed for your steps.
     # Copilot will be given its own token for its operations.
     permissions:
-      # If you want to clone the repository as part of your setup steps, for example to install dependencies, you'll need the `contents: read` permission. If you don't clone the repository in your setup steps, Copilot will do this for you automatically after the steps complete.
       contents: read
 
     # You can define any steps you want, and they will run before the agent starts.
-    # If you do not check out your code, Copilot will do this for you.
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
 
-      - name: Set up MoonBit
+      - name: Set up MoonBit (pinned 0.1.20261104)
+        shell: bash
         run: |
-          curl -fsSL https://cli.moonbitlang.com/install/unix.sh | bash
-          echo "$HOME/.moon/bin" >> $GITHUB_PATH
+          set -uo pipefail
+          mkdir -p "$HOME/.moon/tmp"
+          if ! curl -fsSL https://cli.moonbitlang.com/install/unix.sh -o "$HOME/.moon/tmp/install.sh"; then
+            echo "::error::cannot download https://cli.moonbitlang.com/install/unix.sh"
+            exit 1
+          fi
+          if bash "$HOME/.moon/tmp/install.sh" "0.1.20261104"; then
+            echo "pinned install OK: moon 0.1.20261104"
+          else
+            echo "::warning::pinned install failed (versioned artifacts HTTP 403 on 2026-11-07 probe); falling back to latest + hard version assertion below"
+            bash "$HOME/.moon/tmp/install.sh" || { echo "::error::fallback install failed"; exit 1; }
+          fi
+          echo "$HOME/.moon/bin" >> "$GITHUB_PATH"
 
-      - name: Update MoonBit dependencies
+      - name: Assert locked toolchain versions
+        shell: bash
         run: |
-            moon version --all
-            moon update
-            
+          set -euo pipefail
+          out="$(moon version --all)"
+          echo "$out"
+          grep -qF "moon 0.1.20261104" <<<"$out"
+          grep -qF "moonc v0.10.20+65efd5b93" <<<"$out"
+          grep -qF "moonrun 0.1.20261104" <<<"$out"
+
+      # 已删除：`moon update`（无版本、不可复现）。
+      # 依赖获取：直接使用 moon.mod 中已钉死的版本声明，由 moon check/build 自动同步；
+      # 如确需预取，用 `moon fetch <author>/<name>@<version> --no-update`。
