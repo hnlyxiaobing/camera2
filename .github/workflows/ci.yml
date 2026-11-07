@@ -3,13 +3,18 @@
 #
 # 由 .workbuddy/wp-f-gen-ci.ps1 展开到 4 个 native 模块的 .github/workflows/ci.yml。
 # 模块是独立 git 仓库，workflow 必须放在模块内 .github/workflows/ 才会被 GitHub Actions 触发。
-# 根目录 .github/workflows/ci.yml 只是规范/汇总模板：本仓库根目录不是 git 仓库，不会被执行。
+# 根目录 .github/workflows/ci.yml 只是规范/汇总模板：根目录虽已初始化本地 git 仓库（无 GitHub remote），GitHub Actions 仍不会读取或执行本文件。
 #
-# 四道门禁（顺序执行，任一步非 0 即整 job 失败）：
+# 五道门禁（顺序执行，任一步非 0 即整 job 失败）：
 #   1. moon check --deny-warn
 #   2. moon build
 #   3. moon test
 #   4. moon fmt --check
+#   5. moon info && git diff --exit-code -- pkg.generated.mbti cmd/main/pkg.generated.mbti
+#      （pkg.generated.mbti 快照与源码一致性 fail-closed；cmd/main 下的快照同样纳入 diff 范围。
+#        纳入范围 = 本仓库内受版本控制且由 moon info 生成的全部快照，即仓库根与 cmd/main 两处；
+#        pkg.generated.mbti.r1 是 R1 基线存档、不由 moon info 生成，.mooncakes/ 下第三方包的
+#        快照不受本仓库版本控制，二者均不在 diff 范围。）
 # （可选 moon clean：仅清理，continue-on-error，不参与判定）
 #
 # 工具链钉死（根目录 VERSION-LOCK.md）：
@@ -44,8 +49,8 @@ env:
   CORE_VERSION_LOCKED: "0.10.20+65efd5b93"
 
 jobs:
-  four-gates:
-    name: four-gates (camera2)
+  five-gates:
+    name: five-gates (camera2)
     runs-on: ubuntu-latest
     # 本模块 preferred_target = "native"：build/test 走 native 后端，链接项目内 C stub
     # （stub 例外，真实库对接留 R2，按门禁分阶段解禁，见 ADR-0007）。
@@ -94,22 +99,33 @@ jobs:
           fi
           exit $fail
 
-      # ---- 四道门禁：顺序执行，任一非 0 即失败 ----
-      - name: "Gate 1/4 · moon check --deny-warn"
+      # ---- 五道门禁：顺序执行，任一非 0 即失败 ----
+      - name: "Gate 1/5 · moon check --deny-warn"
         shell: bash
         run: moon check --deny-warn
 
-      - name: "Gate 2/4 · moon build"
+      - name: "Gate 2/5 · moon build"
         shell: bash
         run: moon build
 
-      - name: "Gate 3/4 · moon test"
+      - name: "Gate 3/5 · moon test"
         shell: bash
         run: moon test
 
-      - name: "Gate 4/4 · moon fmt --check"
+      - name: "Gate 4/5 · moon fmt --check"
         shell: bash
         run: moon fmt --check
+
+      - name: "Gate 5/5 · moon info && git diff --exit-code -- pkg.generated.mbti"
+        shell: bash
+        run: |
+          set -euo pipefail
+          moon info
+          if ! git diff --exit-code -- pkg.generated.mbti cmd/main/pkg.generated.mbti; then
+            echo "::error::Gate 5/5 failed: pkg.generated.mbti snapshot out of sync with sources. Run 'moon info' locally and commit the regenerated snapshot together with the API change (additive changes also require an API-CHANGELOG.md entry; freeze policy: COMPATIBILITY.md)."
+            exit 1
+          fi
+          echo "Gate 5/5 OK: snapshot in sync (pkg.generated.mbti + cmd/main/pkg.generated.mbti)"
 
       - name: "Optional · moon clean (not a gate)"
         shell: bash
