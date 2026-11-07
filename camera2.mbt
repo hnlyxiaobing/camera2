@@ -1,0 +1,398 @@
+///|
+/// Android Camera2 的 JNI 封装契约（实现轮）。
+///
+/// 本文件：外部句柄声明、`extern "C"` shim 签名、中性帧值类型、公开 API 实现。
+/// 内部解析/映射辅助见 `internal.mbt`；`stub/camera2_stub.c` 为**桌面 stub**——
+/// 真实 JNI / ajni@0.3.6 / 设备取帧（红米电视 720p YUV）留待 R2（open-questions E4）。
+///
+/// 线程与所有权总则（JNI 硬约束，见 docs/adr/ADR-0009）：
+/// - `JNIEnvPtr` 是线程局部的，禁止缓存、禁止跨线程传递；只缓存 `JavaVMPtr`。
+/// - 原生线程回调前必须 `AttachCurrentThread`，退出前 `DetachCurrentThread`。
+/// - 跨回调长期持有的 Java 对象必须用 `NewGlobalRef` / `DeleteGlobalRef` 管理。
+/// - 帧回调在相机投递线程触发，必须浅拷贝帧数据后 marshal 到 owner 线程，
+///   回调内禁止直接触碰 JNI session、禁止阻塞、禁止保存栈上指针。
+/// - `CameraHandleRaw` / `ImageReaderRaw` 为 C 侧 `void*`，由 `mb_camera2_close` 释放一次。
+/// 平台约束：仅 `native` 目标；Android API 24+（NDK camera2ndk）或 Java Camera2 + ajni。
+
+///|
+#external
+pub type JavaVMPtr
+
+///|
+#external
+pub type JNIEnvPtr
+
+///|
+#external
+pub type JObjectRef
+
+///|
+#external
+pub type CameraHandleRaw
+
+///|
+#external
+pub type ImageReaderRaw
+
+///|
+/// 相机状态机。
+pub(all) enum CameraState {
+  Closed
+  Opening
+  Open
+  Previewing
+  Failed
+}
+
+///|
+/// 预览尺寸。
+pub(all) struct FrameSize {
+  width : Int32
+  height : Int32
+}
+
+///|
+/// YUV_420_888 单平面描述，保留 `row_stride` / `pixel_stride`，不做隐式假设。
+pub(all) struct YuvPlane {
+  data : Bytes
+  row_stride : Int32
+  pixel_stride : Int32
+}
+
+///|
+/// 相机帧的中性值类型（与 `yuv::YuvFrame` 结构一致，由组合根适配）。
+pub(all) struct YuvFrame {
+  width : Int32
+  height : Int32
+  planes : Array[YuvPlane]
+  timestamp_ns : UInt64
+}
+
+///|
+/// 相机元数据摘要（不含厂商扩展）。
+pub(all) struct CameraInfo {
+  id : String
+  facing : Facing
+  supported_sizes : Array[FrameSize]
+  supports_yuv420888 : Bool
+}
+
+///|
+pub(all) enum Facing {
+  Front
+  Back
+  External
+}
+
+///|
+/// 打开配置。
+pub(all) struct CameraConfig {
+  camera_id : String
+  size : FrameSize
+  max_inflight_buffers : Int32
+  rotation_degrees : Int32
+  mirror_x : Bool
+}
+
+///|
+/// MoonBit 侧相机包装值；`handle` 为 C 侧裸指针，`state` 用于禁止重复 open/close。
+pub(all) struct Camera {
+  handle : CameraHandleRaw
+  reader : ImageReaderRaw
+  config : CameraConfig
+  state : CameraState
+  owner_thread_id : UInt64
+}
+
+///|
+/// 相机错误模型（`pub(all)`：组合根可替换帧源需在包外构造/抛出，ADR-0004）。
+#derive(Debug)
+pub(all) suberror CameraError {
+  PermissionDenied(String)
+  CameraNotFound(String)
+  OpenFailed(Int32, String)
+  PreviewFailed(Int32, String)
+  UnsupportedSize(Int32, Int32)
+  UnsupportedFormat(String)
+  BufferAcquireFailed(Int32)
+  BufferPoolExhausted(Int32)
+  JniThreadNotAttached(String)
+  AlreadyOpen
+  AlreadyClosed
+  VendorQuirk(String)
+}
+
+///|
+pub extend CameraError with Debug::{to_repr}
+
+///|
+/// 帧回调的 MoonBit 侧类型（可捕获闭包；跨 C 边界时由 shim 用 `FuncRef` + closure 传递）。
+pub type FrameCallback = (YuvFrame) -> Unit
+
+///|
+/// 帧源契约；`pose` / `yuv` 不依赖本库，组合根决定是否注入相机或文件帧源。
+/// `pub(open)`：供包外实现（文件帧源 / RTSP / 桌面摄像头），ADR-0004 可替换性。
+pub(open) trait FrameSource {
+  fn grab_yuv(Self) -> YuvFrame raise CameraError
+  fn close(Self) -> Unit raise CameraError
+}
+
+///|
+/// ---- 外部 C shim 声明 ----
+/// 符号由 `stub/camera2_stub.c`（桌面 stub，本轮）提供；
+/// R2 起由 Java 侧 + 真实 JNI `native-stub` 提供同名符号。
+/// ABI：Int→int32_t、UInt64→uint64_t、Unit→void、Bytes/FixedArray[Byte]→uint8_t*、
+/// #external→void*、FuncRef→函数指针、`() -> Unit` 闭包→MoonBit 对象指针。
+
+///|
+/// 进程级初始化：缓存 `JavaVM*`，不缓存 `JNIEnv*`。必须在任何 open 之前调用一次。
+pub extern "C" fn mb_camera2_init(vm : JavaVMPtr) -> Int32 = "mb_camera2_init"
+
+///|
+/// 打开相机；`camera_id` 为 `#borrow`，C 侧只读取。
+#borrow(camera_id)
+pub extern "C" fn mb_camera2_open(
+  camera_id : Bytes,
+  width : Int32,
+  height : Int32,
+  max_buffers : Int32,
+) -> CameraHandleRaw = "mb_camera2_open"
+
+///|
+/// 创建 ImageReader（YUV_420_888），返回独立句柄。
+pub extern "C" fn mb_camera2_create_reader(
+  camera : CameraHandleRaw,
+  width : Int32,
+  height : Int32,
+  max_buffers : Int32,
+) -> ImageReaderRaw = "mb_camera2_create_reader"
+
+///|
+/// 启动重复预览请求。
+pub extern "C" fn mb_camera2_start_preview(
+  camera : CameraHandleRaw,
+  reader : ImageReaderRaw,
+) -> Int32 = "mb_camera2_start_preview"
+
+///|
+/// 同步取一帧；`dst` 由 C 侧填充为「3 段 plane + stride 头」的原始缓冲。
+/// `#borrow` 表示 MoonBit 保留缓冲所有权，C 侧不 decref。
+#borrow(dst)
+pub extern "C" fn mb_camera2_acquire_frame(
+  reader : ImageReaderRaw,
+  dst : FixedArray[Byte],
+  capacity : Int32,
+  timeout_ms : Int32,
+) -> Int32 = "mb_camera2_acquire_frame"
+
+///|
+/// 归还 Image 缓冲。必须在读取完 plane 字节后调用，否则缓冲池耗尽。
+pub extern "C" fn mb_camera2_release_frame(reader : ImageReaderRaw) -> Unit = "mb_camera2_release_frame"
+
+///|
+/// 注册帧回调。`closure` 为 `#owned`：C 侧长期持有 MoonBit 闭包，
+/// 注销时须由 shim 执行 `moonbit_decref`；`cb` 为无捕获 `FuncRef` 适配器。
+/// 回调在相机投递线程触发，**不得**在其中直接使用 JNI session。
+#owned(closure)
+pub extern "C" fn mb_camera2_set_frame_callback(
+  reader : ImageReaderRaw,
+  cb : FuncRef[(() -> Unit) -> Unit],
+  closure : () -> Unit,
+) -> Int32 = "mb_camera2_set_frame_callback"
+
+///|
+/// 注销帧回调并释放 `#owned` 持有的闭包。
+pub extern "C" fn mb_camera2_clear_frame_callback(
+  reader : ImageReaderRaw,
+) -> Unit = "mb_camera2_clear_frame_callback"
+
+///|
+/// 关闭并释放 reader + camera 句柄（唯一释放点，且只能一次）。
+pub extern "C" fn mb_camera2_close(
+  camera : CameraHandleRaw,
+  reader : ImageReaderRaw,
+) -> Unit = "mb_camera2_close"
+
+///|
+/// ---- MoonBit 侧公开 API（全部已实现）----
+
+///|
+/// 打开相机并进入 `Open` 状态。
+///
+/// - 获取资源：camera 句柄 + ImageReader 句柄；失败时逆序释放（reader 失败先还 camera）。
+/// - 错误：权限、设备不存在、尺寸/格式不支持、JNI 线程未 attach、会话占用均以
+///   `CameraError` 传播（C status → CameraError 映射，见 `internal.mbt`）。
+/// - 线程：必须在 JNI session 的 owner 线程调用；`Camera` 绑定到 `owner_thread_id`。
+/// - 状态机：句柄存活状态由 C 侧会话注册表裁决（本值类型字段不可变，见报告偏差）。
+/// - 非目标：不做推理、不做渲染、不做 YUV→RGB 转换、不实现权限 UI。
+/// - 桌面 stub：真实 Java Camera2 样板 / ajni host bridge / 权限流程留待 R2（E4）。
+pub fn Camera::open(
+  vm : JavaVMPtr,
+  config : CameraConfig,
+) -> Camera raise CameraError {
+  let width = config.size.width
+  let height = config.size.height
+  if width <= 0 || height <= 0 {
+    raise CameraError::UnsupportedSize(width, height)
+  }
+  if config.max_inflight_buffers < 1 {
+    raise CameraError::OpenFailed(
+      -13, "Camera::open: max_inflight_buffers must be >= 1",
+    )
+  }
+  let init_status = mb_camera2_init(vm)
+  if init_status != 0 {
+    raise open_error(
+      init_status, "Camera::open: mb_camera2_init", width, height,
+    )
+  }
+  let id_bytes = @utf8.encode(config.camera_id)
+  let handle = mb_camera2_open(
+    id_bytes,
+    width,
+    height,
+    config.max_inflight_buffers,
+  )
+  let open_status = mb_camera2_last_status()
+  if open_status != 0 {
+    raise open_error(
+      open_status,
+      "Camera::open: " + config.camera_id,
+      width,
+      height,
+    )
+  }
+  let reader = mb_camera2_create_reader(
+    handle,
+    width,
+    height,
+    config.max_inflight_buffers,
+  )
+  let reader_status = mb_camera2_last_status()
+  if reader_status != 0 {
+    // 失败逆序释放：归还已取得的 camera 句柄（reader 为空）。
+    mb_camera2_close(handle, reader)
+    raise open_error(
+      reader_status, "Camera::open: mb_camera2_create_reader", width, height,
+    )
+  }
+  Camera::{
+    handle,
+    reader,
+    config,
+    state: CameraState::Open,
+    owner_thread_id: mb_camera2_current_thread_id(),
+  }
+}
+
+///|
+/// 启动预览（重复请求）；幂等，重复调用返回成功但不重复建会话。
+/// 线程：owner 线程；会话未存活（未 open / 已 close）拒绝操作。
+pub fn Camera::start_preview(self : Camera) -> Unit raise CameraError {
+  ensure_session(self.handle, self.reader)
+  ensure_owner(self.owner_thread_id)
+  let status = mb_camera2_start_preview(self.handle, self.reader)
+  if status != 0 {
+    raise preview_error(
+      status,
+      "Camera::start_preview: mb_camera2_start_preview",
+      self.config.size.width,
+      self.config.size.height,
+    )
+  }
+}
+
+///|
+/// 同步取一帧 YUV_420_888；返回纯值，缓冲已归还给 ImageReader（每帧 acquire→release）。
+/// 超时抛 `BufferAcquireFailed(timeout_ms)`，缓冲池在飞数耗尽抛
+/// `BufferPoolExhausted(max_inflight_buffers)`，二者可判。
+/// 线程：owner 线程；会话未存活拒绝操作。
+pub fn Camera::grab_yuv(
+  self : Camera,
+  timeout_ms : Int32,
+) -> YuvFrame raise CameraError {
+  ensure_session(self.handle, self.reader)
+  ensure_owner(self.owner_thread_id)
+  Camera::acquire_frame_value(self, timeout_ms)
+}
+
+///|
+/// 注册帧回调。回调必须浅拷贝帧数据并 marshal 到 owner 线程，不得在回调内做 JNI 调用。
+///
+/// - 跨 C 边界拆为 `FuncRef` 无捕获适配器 + `#owned` 闭包二元组（ADR-0009）；
+///   C 侧长期持有闭包，注销/替换/关闭时 `moonbit_decref`，成对不泄漏。
+/// - 每次投递时 thunk 同步取一帧（acquire→release，浅拷贝为纯值）再调用 `cb`；
+///   取帧失败则本次不调用 `cb`。
+/// - 回调在相机投递线程触发（stub 可从独立投递线程调用）；**回调内禁止直接
+///   使用 JNI session、禁止阻塞**，须自行 marshal 到 owner 线程。
+/// - 线程：注册须在 owner 线程；会话未存活拒绝操作。
+pub fn Camera::on_frame(
+  self : Camera,
+  cb : FrameCallback,
+) -> Unit raise CameraError {
+  ensure_session(self.handle, self.reader)
+  ensure_owner(self.owner_thread_id)
+  let thunk : () -> Unit = fn() {
+    try {
+      let frame = Camera::acquire_frame_value(self, 0)
+      cb(frame)
+    } catch {
+      _ => ()
+    }
+  }
+  let status = mb_camera2_set_frame_callback(self.reader, fn(f) { f() }, thunk)
+  if status != 0 {
+    raise open_error(
+      status,
+      "Camera::on_frame: mb_camera2_set_frame_callback",
+      self.config.size.width,
+      self.config.size.height,
+    )
+  }
+}
+
+///|
+/// 注销帧回调并释放 `#owned` 持有的闭包（幂等；未注册时为 no-op）。
+/// 注销后不再触发。线程：owner 线程；会话未存活拒绝操作。
+pub fn Camera::clear_on_frame(self : Camera) -> Unit raise CameraError {
+  ensure_session(self.handle, self.reader)
+  ensure_owner(self.owner_thread_id)
+  mb_camera2_clear_frame_callback(self.reader)
+}
+
+///|
+/// 关闭相机并释放全部 C 句柄（唯一释放点，且只能一次）：
+/// 先注销回调（释放 `#owned` 闭包），再释放 reader + camera。
+/// 重复调用报 `AlreadyClosed`（不重复释放）。
+pub fn Camera::close(self : Camera) -> Unit raise CameraError {
+  ensure_session(self.handle, self.reader)
+  mb_camera2_clear_frame_callback(self.reader)
+  mb_camera2_close(self.handle, self.reader)
+}
+
+///|
+/// 枚举可用相机（只读快照，不打开设备）。
+/// 线程：须在 JNI 会话已附着的线程调用；未附着抛 `JniThreadNotAttached`。
+pub fn enumerate_cameras(vm : JavaVMPtr) -> Array[CameraInfo] raise CameraError {
+  let init_status = mb_camera2_init(vm)
+  if init_status != 0 {
+    raise open_error(init_status, "enumerate_cameras: mb_camera2_init", 0, 0)
+  }
+  let capacity = 8192
+  let dst = FixedArray::make(capacity, b'\x00')
+  let ret = mb_camera2_enumerate_raw(vm, dst, capacity)
+  if ret == -12 {
+    let big = FixedArray::make(65536, b'\x00')
+    let ret2 = mb_camera2_enumerate_raw(vm, big, 65536)
+    if ret2 < 0 {
+      raise open_error(
+        ret2, "enumerate_cameras: mb_camera2_enumerate_raw", 0, 0,
+      )
+    }
+    parse_camera_infos(big, ret2)
+  } else if ret < 0 {
+    raise open_error(ret, "enumerate_cameras: mb_camera2_enumerate_raw", 0, 0)
+  } else {
+    parse_camera_infos(dst, ret)
+  }
+}

@@ -1,0 +1,5 @@
+import {
+  "hnlyxiaobing/camera2",
+}
+
+pkgtype(kind: "executable")
