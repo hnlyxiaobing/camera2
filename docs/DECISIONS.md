@@ -54,7 +54,7 @@ Oracle JNI 规范（Java SE 24，第 5 章）`[事实]`：
 
 ### 决策
 
-`moon.mod` 的 `preferred_target` 从 `"wasm"` 改为 `"native"`。**这是唯一配置改动**，不改目录结构、不改 `moon.pkg`、不改其它字段。理由：本库的价值就是外部 C ABI，wasm 目标下无法表达其接口。`moon check` 生成的 API 快照 `pkg.generated.mbti` 保留在版本库中作为评审依据。
+`../moon.mod` 的 `preferred_target` 从 `"wasm"` 改为 `"native"`。**这是唯一配置改动**，不改目录结构、不改 `../moon.pkg`、不改其它字段。理由：本库的价值就是外部 C ABI，wasm 目标下无法表达其接口。`moon check` 生成的 API 快照 `../pkg.generated.mbti` 保留在版本库中作为评审依据。
 
 ### 理由
 
@@ -89,7 +89,7 @@ trait object 调用的一次间接跳转对 5–15 fps 的体感预算可忽略�
 
 ### 后果
 
-`pose` / `yuv` 可用 Mock / 文件帧源做纯 MoonBit 桌面验证，无需设备；组合根多一个薄适配器文件；`YuvFrame` 与 `yuv::YuvFrame` 结构一致但各自定义，结构漂移风险靠 API 快照（`pkg.generated.mbti`）与组合根测试守住。
+`pose` / `yuv` 可用 Mock / 文件帧源做纯 MoonBit 桌面验证，无需设备；组合根多一个薄适配器文件；`YuvFrame` 与 `yuv::YuvFrame` 结构一致但各自定义，结构漂移风险靠 API 快照（`../pkg.generated.mbti`）与组合根测试守住。
 
 ## 4. ajni 只作设计参照，真实 JNI 样板排后
 
@@ -99,7 +99,7 @@ mooncakes.io 上存在 `Nanaloveyuki/ajni@0.3.6`（Apache-2.0，双向 checked J
 
 ### 决策
 
-- 当前**零外部依赖**：9 个 `mb_camera2_*` shim 由项目内 `stub/camera2_stub.c` 桌面 stub 提供，**未链接/下载任何外部库**。
+- 当前**零外部依赖**：9 个 `mb_camera2_*` shim 由项目内 `../stub/camera2_stub.c` 桌面 stub 提供，**未链接/下载任何外部库**。
 - `ajni@0.3.6` 只作**设计参照**：本库线程边界（见 §1）借鉴其契约，但不引入依赖。
 - Java 侧约 200 行 Camera2 样板、真实 `native-stub` C 文件、`ajni` 依赖均排在**后续真实 JNI 对接阶段**；引入前须过五条门槛评估并完成真机实证。
 

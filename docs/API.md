@@ -2,7 +2,7 @@
 
 > **API 冻结前整改后**。`preferred_target = "native"`，错误传播统一 `raise CameraError`。
 > MoonBit 侧 API **全部已实现**（桌面 C stub 双路径），无 `declare` 残留、无 `0068` 告警。
-> 快照 `pkg.generated.mbti` 由工具链在 `moon check` / `moon build` 时**自动同步**为
+> 快照 `../pkg.generated.mbti` 由工具链在 `moon check` / `moon build` 时**自动同步**为
 > 整改后公开面（9 个 `mb_camera2_*` shim 消失、`CameraState` 收紧为 `Open` 等）；
 > 手工刷新可运行 `moon info`。
 
@@ -21,7 +21,7 @@
 > **API 冻结前整改**：9 个 `mb_camera2_*` 全部改为**包私有**，不再出现在公开 API / 快照；
 > 实现与内部调用（`Camera::{open,start_preview,grab_yuv,on_frame,clear_on_frame,close}`、
 > `enumerate_cameras`）全部保留，符号名与签名不变，后续真实 JNI 对接无需改 ABI。
-> 黑盒测试不直接调用 shim；直接调用的白盒用例留在 `camera2_wbtest.mbt`。
+> 黑盒测试不直接调用 shim；直接调用的白盒用例留在 `../camera2_wbtest.mbt`。
 > 下表仅作**内部 ABI 文档**，不构成公共 API 承诺。
 
 | shim（包私有） | 所有权 / 回调 | 语义 |
@@ -83,4 +83,4 @@ pub(open) trait FrameSource {
 **API 冻结前整改实跑**：`moon clean` / `moon check --deny-warn` / `moon build` /
 `moon test`（21 测试全过）/ `moon fmt --check` 全部 exit 0（桌面 C stub 环境）。
 真实 JNI / Java 样板 / ajni / 设备取帧排**后续真实对接阶段**（ajni 真机可用性未实证，见 README「风险与待验证」）；当前保持项目内 C stub 双路径，
-未链接/下载任何外部库。API 快照：`pkg.generated.mbti`（由工具链自动同步至整改后公开面）。
+未链接/下载任何外部库。API 快照：`../pkg.generated.mbti`（由工具链自动同步至整改后公开面）。

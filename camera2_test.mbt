@@ -3,7 +3,7 @@
 // Run `moon test` to execute and `moon test --update` to refresh snapshots.
 //
 // 覆盖：YuvFrame/YuvPlane 值类型构造与 stride 描述、包外构造 CameraError、
-// 包外实现 FrameSource（可替换帧源设计：文件帧源替身，见 DECISIONS.md）。
+// 包外实现 FrameSource（可替换帧源设计：文件帧源替身，见 docs/DECISIONS.md）。
 
 ///|
 fn b_bytes(vals : Array[Int32]) -> Bytes {
@@ -69,7 +69,7 @@ test "CameraError can be constructed and matched outside the package" {
 }
 
 ///|
-/// 包外实现 FrameSource：文件帧源替身（组合根可替换帧源，见 DECISIONS.md）。
+/// 包外实现 FrameSource：文件帧源替身（组合根可替换帧源，见 docs/DECISIONS.md）。
 struct FileSource {
   frames : Array[@camera2.YuvFrame]
   cursor : Array[Int32]

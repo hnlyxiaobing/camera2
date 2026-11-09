@@ -16,7 +16,7 @@ extern "C" fn mb_camera2_last_status() -> Int32 = "mb_camera2_last_status"
 
 ///|
 /// 当前线程 id；用于 `Camera.owner_thread_id` 归属校验（线程约束见
-/// DECISIONS.md「JNI 线程亲和性与回调所有权」）。
+/// docs/DECISIONS.md「JNI 线程亲和性与回调所有权」）。
 extern "C" fn mb_camera2_current_thread_id() -> UInt64 = "mb_camera2_current_thread_id"
 
 ///|
@@ -170,7 +170,7 @@ fn ensure_session(
 }
 
 ///|
-/// 线程归属守卫（JNI 线程约束，见 DECISIONS.md）：非 owner 线程视为 JNI 会话未附着。
+/// 线程归属守卫（JNI 线程约束，见 docs/DECISIONS.md）：非 owner 线程视为 JNI 会话未附着。
 fn ensure_owner(owner_thread_id : UInt64) -> Unit raise CameraError {
   if mb_camera2_current_thread_id() != owner_thread_id {
     raise CameraError::JniThreadNotAttached(

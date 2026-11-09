@@ -3,30 +3,30 @@
 **Android Camera2 的 JNI 封装 —— 权限、打开、预览 Surface、ImageReader 取 YUV 与关闭的完整相机生命周期。**
 
 > 状态：**实现完成（2026-11-07，桌面 stub 阶段）+ R4 E1 回调 marshal 层（2026-11-09）**。全部导出接口已实现，`moon build` / `moon test` 全绿（**30 测试**，`0068` 清零）。本阶段自带**桌面 C stub**（`stub/camera2_stub.c`）模拟 JavaVM/ImageReader/相机会话；**真实 JNI / Java 样板 / ajni / 设备取帧留待后续真实对接阶段**（ajni 在 Windows 主机 + 目标设备真机的可用性未实证，见「风险与待验证」）。
-> **R4 E1（回调线程安全）**：帧回调投递线程**不再直接执行 MoonBit 闭包**——改为「投递线程浅拷贝入 C 侧有界 marshal 队列 → owner 线程 `Camera::pump_marshal` 同步派发」（ADR-0009）。重入 pump 返回 `MarshalReentrant`；关闭竞态由 C 侧延迟释放收敛。并发/重入/满队列/关闭竞态白盒测试已绿；**Linux pthread 原实验（无捕获 FuncRef / `#owned` 闭包反复调用）在本机 Windows 无法执行，仍 [仍需实测]**（最小实验方案见 `DESIGN.md` §14）。
+> **R4 E1（回调线程安全）**：帧回调投递线程**不再直接执行 MoonBit 闭包**——改为「投递线程浅拷贝入 C 侧有界 marshal 队列 → owner 线程 `Camera::pump_marshal` 同步派发」（ADR-0009）。重入 pump 返回 `MarshalReentrant`；关闭竞态由 C 侧延迟释放收敛。并发/重入/满队列/关闭竞态白盒测试已绿；**Linux pthread 原实验（无捕获 FuncRef / `#owned` 闭包反复调用）在本机 Windows 无法执行，仍 [仍需实测]**（最小实验方案见 `docs/DESIGN.md` §14）。
 > **API 冻结前整改已落实**：`FrameSource` 方法集冻结（`grab_yuv(Self)`，trait 层无超时参数，超时策略由具体帧源实现自行定义）· `CameraError` 追认 `pub(all) suberror` · `CameraState` 收紧为 `Open` 单分支 · 9 个 `mb_camera2_*` shim 移出公开 API（包私有，私有实现 ABI）· `close` 幂等措辞统一为「不会二次释放，重复调用返回明确错误」。门禁 `moon clean` / `moon check --deny-warn` / `moon build` / `moon test` / `moon fmt --check` 全绿。
-> `preferred_target` 已由 `wasm` 改为 `native`（唯一配置改动，理由见 `DECISIONS.md`「preferred_target 由 wasm 改为 native」）。
+> `preferred_target` 已由 `wasm` 改为 `native`（唯一配置改动，理由见 `docs/DECISIONS.md`「preferred_target 由 wasm 改为 native」）。
 
 ## 定位与为什么存在
 
 生态检索复核（2026-11-06）：`camera2` 命中全为 2D 游戏相机误报。Camera2 是平台 Java API（NDK camera2ndk 需 API 24+），2026-11-06 检索 mooncakes.io 无 Android 取帧绑定（`justjavac/camera@0.1.3`(MIT) 是桌面 native 摄像头发现，不能替代 Android 取帧），故走 **FFI-JNI 封装**。本库是感知闭环的**可替换帧源**，产出中性 `YuvFrame`。
 
-**关键设计（JNI 线程亲和性与回调所有权，完整决策见 `DECISIONS.md`）**：JNI 线程亲和性决定 `JNIEnv*` 绝不进入 MoonBit 值类型；`JavaVM*` 只在 C 侧缓存；帧回调在相机投递线程触发，必须 marshal 到 owner 线程；`FuncRef` 只能无捕获，回调状态（global ref / attach 状态）下沉到 C shim。因此「胶水 C 文件极薄」的说法应修正为「**薄在 ABI 转发，厚在生命周期与线程编排**」。
+**关键设计（JNI 线程亲和性与回调所有权，完整决策见 `docs/DECISIONS.md`）**：JNI 线程亲和性决定 `JNIEnv*` 绝不进入 MoonBit 值类型；`JavaVM*` 只在 C 侧缓存；帧回调在相机投递线程触发，必须 marshal 到 owner 线程；`FuncRef` 只能无捕获，回调状态（global ref / attach 状态）下沉到 C shim。因此「胶水 C 文件极薄」的说法应修正为「**薄在 ABI 转发，厚在生命周期与线程编排**」。
 
 ## 能力范围 / 非目标
 
 - **做**：进程级 JNI 初始化、相机打开、ImageReader(YUV_420_888) 创建、重复预览请求、同步取帧、帧回调注册/注销、缓冲归还、关闭释放、相机能力枚举。
 - **不做**：推理、渲染、YUV→RGB 转换、权限 UI、Camera2 厂商 quirk 自动修复、视频编码、Surface 渲染。
-- 相机是**可替换帧源**：`pose` / `yuv` 不依赖本库，组合根可换成本地图片 / RTSP / 桌面摄像头（见 `DECISIONS.md`「可替换帧源设计（FrameSource trait）」）。
+- 相机是**可替换帧源**：`pose` / `yuv` 不依赖本库，组合根可换成本地图片 / RTSP / 桌面摄像头（见 `docs/DECISIONS.md`「可替换帧源设计（FrameSource trait）」）。
 
 ## 公开接口（速览）
 
-`Camera::{open, start_preview, grab_yuv, on_frame, clear_on_frame, pump_marshal, close}`、`enumerate_cameras`。外部句柄与 shim 清单见 `API.md`。
+`Camera::{open, start_preview, grab_yuv, on_frame, clear_on_frame, pump_marshal, close}`、`enumerate_cameras`。外部句柄与 shim 清单见 `docs/API.md`。
 
 ## 依赖
 
 - **零外部依赖**；独立 `moon.mod`，`moon check --deny-warn` 独立通过。shim 实现仅为**项目内** `stub/camera2_stub.c` 桌面 stub（9 个 `mb_camera2_*` 为包私有 ABI，非公共 API），**未链接/下载任何外部库**。
-- 后续阶段：`Nanaloveyuki/ajni@0.3.6`（Apache-2.0，双向 checked JNI + Android host bridge）、Java 侧约 200 行 Camera2 样板、真实 `native-stub` C 文件。**均未引入**——`ajni` 为 0.x 且作者自述 "Windows/macOS desktop ABI support is not claimed"，需按依赖门槛（用途/许可/维护/平台/风险）评估后再引入（见 `DECISIONS.md`「ajni 只作设计参照，真实 JNI 样板排后」）。
+- 后续阶段：`Nanaloveyuki/ajni@0.3.6`（Apache-2.0，双向 checked JNI + Android host bridge）、Java 侧约 200 行 Camera2 样板、真实 `native-stub` C 文件。**均未引入**——`ajni` 为 0.x 且作者自述 "Windows/macOS desktop ABI support is not claimed"，需按依赖门槛（用途/许可/维护/平台/风险）评估后再引入（见 `docs/DECISIONS.md`「ajni 只作设计参照，真实 JNI 样板排后」）。
 
 ## 风险与待验证
 
@@ -56,8 +56,8 @@
 
 ## 开发顺序说明
 
-`camera2` 不排在感知链的最前：最小验证场景（本地图片 + Mock 后端）不需要真实相机即可在桌面验证上层；相机是可替换帧源，不是 `pose` 的前置（见 `DECISIONS.md`「开发排序：相机不是姿态门面的前置」）。
+`camera2` 不排在感知链的最前：最小验证场景（本地图片 + Mock 后端）不需要真实相机即可在桌面验证上层；相机是可替换帧源，不是 `pose` 的前置（见 `docs/DECISIONS.md`「开发排序：相机不是姿态门面的前置」）。
 
 ## 文档索引
 
-`DESIGN.md`（设计契约）· `API.md`（公开 API 与内部 ABI）· `DECISIONS.md`（设计决策记录：线程与所有权 / native 目标 / 可替换帧源 / 依赖门槛）
+`docs/DESIGN.md`（设计契约）· `docs/API.md`（公开 API 与内部 ABI）· `docs/DECISIONS.md`（设计决策记录：线程与所有权 / native 目标 / 可替换帧源 / 依赖门槛）

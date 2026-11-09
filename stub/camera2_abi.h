@@ -5,7 +5,7 @@
  * - 当前实现：stub/camera2_stub.c（桌面 stub，模拟 Java Camera2 / JNI 语义）；
  * - 后续真实对接（E4 解禁后的 P1）：真实 JNI native-stub C 文件**实现同一批符号**，
  *   MoonBit 侧 extern 声明零改动（符号名 / 签名 / 状态码不变）。
- * 真实 Java Camera2 样板与 ajni@0.3.6 host bridge 的设计见 DESIGN.md §15。
+ * 真实 Java Camera2 样板与 ajni@0.3.6 host bridge 的设计见 docs/DESIGN.md §15。
  *
  * ABI（MoonBit native/C 后端，见 MoonBit FFI 文档）：
  *   Int -> int32_t, UInt64 -> uint64_t, Unit -> void,

@@ -12,7 +12,7 @@ L3 感知绑定层的**帧源 JNI 封装**。职责：相机生命周期 + 取 Y
 Java Camera2 / NDK camera2ndk
       ▲ JNI
 mb_camera2_*  extern "C" shim（15 个 `mb_camera2_*`，**包私有 ABI，非公共 API**；
-      │         当前为项目内桌面 stub；完整契约见 stub/camera2_abi.h）
+      │         当前为项目内桌面 stub；完整契约见 ../stub/camera2_abi.h）
       ▲
 Camera::{open,start_preview,grab_yuv,on_frame,pump_marshal,close}   ← 已实现（MoonBit 层公开 API）
       │
@@ -66,14 +66,14 @@ Camera::{open,start_preview,grab_yuv,on_frame,pump_marshal,close}   ← 已实�
 - `preferred_target = "native"`（由 `wasm` 调整，理由见 `DECISIONS.md`「preferred_target 由 wasm 改为 native」）；Windows native 需 MSVC；LLVM 后端无 FFI。
 - Android：Java Camera2 全版本；NDK `ACameraManager_*` / `AImageReader` 要求 **API 24+**；`AIMAGE_FORMAT_YUV_420_888` 三平面 Y/U/V，Y 的 pixelStride=1，U/V 共享 rowStride/pixelStride。
 - 后续依赖：`ajni@0.3.6`、Java 样板、真实 JNI `native-stub` C 文件（**均未引入**，排后续真实对接阶段，门槛见 `DECISIONS.md`「ajni 只作设计参照，真实 JNI 样板排后」）；
-  当前 shim 实现仅为项目内 `stub/camera2_stub.c` 桌面 stub，**未链接/下载任何外部库**。
+  当前 shim 实现仅为项目内 `../stub/camera2_stub.c` 桌面 stub，**未链接/下载任何外部库**。
 
 ## 8. 外部类型 / 句柄 / 回调签名 / 所有权规则
 
 | 类别 | 声明 | 规则 |
 |---|---|---|
 | 外部类型 | 5 个 `#external pub type` | C `void*`；MoonBit 不引用计数；**永不跨模块传递** |
-| 外部函数 | 15 个 `extern "C" fn mb_camera2_* = "…"`（**包私有，私有实现 ABI、非公共 API**；API 冻结前移出公开 API；契约见 `stub/camera2_abi.h`） | 由 Java 侧 + `native-stub`（后续真实对接，§15）或项目内桌面 stub（当前）提供 |
+| 外部函数 | 15 个 `extern "C" fn mb_camera2_* = "…"`（**包私有，私有实现 ABI、非公共 API**；API 冻结前移出公开 API；契约见 `../stub/camera2_abi.h`） | 由 Java 侧 + `native-stub`（后续真实对接，§15）或项目内桌面 stub（当前）提供 |
 | 回调签名 | `mb_camera2_set_frame_callback(reader, cb : FuncRef[(() -> Unit) -> Unit], closure : () -> Unit) -> Int` | `FuncRef` 必须**无捕获**；`closure` 用 `#owned(closure)`，C 侧长期持有，注销时 `moonbit_decref`；闭包只由 `mb_camera2_marshal_pump` 在 owner 线程派发 |
 | `#borrow` | `mb_camera2_open(camera_id)`、`mb_camera2_acquire_frame(dst)`、`mb_camera2_marshal_next(dst)` | MoonBit 保留缓冲所有权，C 侧只读/填充，不 decref |
 | 状态存放 | JavaVM / global ref / attach 状态 / per-thread data | 全部在 C shim 或 `#external` 句柄中，**不装进 MoonBit 闭包** |
@@ -106,7 +106,7 @@ Camera::{open,start_preview,grab_yuv,on_frame,pump_marshal,close}   ← 已实�
 
 ## 13. 当前状态与 TODO
 
-`camera2.mbt` / `internal.mbt` 已写入 5 个 `#external` 句柄、15 个**包私有** shim、值类型、
+`../camera2.mbt` / `../internal.mbt` 已写入 5 个 `#external` 句柄、15 个**包私有** shim、值类型、
 错误模型与全部 MoonBit 层 API 实现（状态守卫 / 错误映射 / YUV 解析校验）；公开 API 有 `///` 文档注释。
 **API 冻结前整改已落实**：`FrameSource` 方法集冻结（trait 层无超时参数）、
 `CameraError` 追认 `pub(all) suberror`、`CameraState` 收紧为 `Open`、
@@ -117,9 +117,9 @@ shim 移出公开 API、close 幂等措辞统一（汇总见 `DECISIONS.md`「AP
 
 ## 14. 回调 marshal 层设计（R4：投递线程 → owner 线程）
 
-> ADR-0009「线程与回调所有权」Decision 4 的落地机制。实现 = `stub/camera2_stub.c` marshal
+> ADR-0009「线程与回调所有权」Decision 4 的落地机制。实现 = `../stub/camera2_stub.c` marshal
 > 队列 + `mb_camera2_marshal_pump` / `mb_camera2_marshal_next` + `Camera::pump_marshal`
-> + `Camera::on_frame` thunk；测试白盒清单见 `camera2_wbtest.mbt`。
+> + `Camera::on_frame` thunk；测试白盒清单见 `../camera2_wbtest.mbt`。
 
 ### 14.1 线程角色
 
@@ -192,7 +192,7 @@ E1（MoonBit 运行时在外部线程执行闭包的线程安全）对本模块�
 
 ### 15.1 真实 JNI native-stub C 文件
 
-- **ABI 冻结**：`stub/camera2_abi.h` 即契约——真实 native-stub 实现同一批 `mb_camera2_*`
+- **ABI 冻结**：`../stub/camera2_abi.h` 即契约——真实 native-stub 实现同一批 `mb_camera2_*`
   符号（9 核心 + 2 marshal + 4 内部），MoonBit 侧 extern 声明**零改动**。
 - 职责映射（与桌面 stub 同构）：`mb_camera2_init` 缓存 `JavaVM*`（只缓存 VM）；投递侧 =
   Java `ImageReader.OnImageAvailableListener` → JNI native 回调（投递线程）→ 按
@@ -202,7 +202,7 @@ E1（MoonBit 运行时在外部线程执行闭包的线程安全）对本模块�
   `Surface` Java 对象；`mb_camera2_close` 逆序 `DeleteGlobalRef` + close；native 线程
   attach / detach 状态由 C 侧管理（ADR-0009 Decision 1/2）。
 - 入库红线：真实 `.so` / devkit 不入库（ADR-0011 口径），本地链接 + SHA-256 +
-  PROVENANCE 登记；`stub/camera2_stub.c` 保持可移植桌面回退。
+  PROVENANCE 登记；`../stub/camera2_stub.c` 保持可移植桌面回退。
 
 ### 15.2 Java Camera2 样板（约 200 行，设计预留）
 
@@ -228,15 +228,15 @@ E1（MoonBit 运行时在外部线程执行闭包的线程安全）对本模块�
 ## 16. E1 最小实验方案（**[仍需实测]**，Linux x86-64 native 口径）
 
 **目标**：验证 MoonBit 运行时（GC、引用计数、重入）在非 MoonBit 线程上执行无捕获
-`FuncRef` 与 `#owned` 闭包的线程安全（`docs/open-questions.md` E1，P0）。
+`FuncRef` 与 `#owned` 闭包的线程安全（`../../docs/open-questions.md` E1，P0）。
 
-**环境**：Linux x86-64；`moon 0.1.20261104` / `moonc v0.10.20+65efd5b93`（`VERSION-LOCK.md`
+**环境**：Linux x86-64；`moon 0.1.20261104` / `moonc v0.10.20+65efd5b93`（`../../VERSION-LOCK.md`
 口径）；`preferred_target = "native"`；GCC 或 Clang + pthread。
 
 **步骤（最小可执行）**：
 
-1. 一次性探针模块（不入 11 模块仓库）：`moon.mod` `preferred_target = "native"`，
-   `moon.pkg` `native-stub` 指向 pthread C 文件（模式照抄 `stub/camera2_stub.c`）。
+1. 一次性探针模块（不入 11 模块仓库）：`../moon.mod` `preferred_target = "native"`，
+   `../moon.pkg` `native-stub` 指向 pthread C 文件（模式照抄 `../stub/camera2_stub.c`）。
 2. C 侧起 4 个 pthread，每个反复（≥ 10⁶ 次）调用两类目标：① 无捕获 `FuncRef` 适配器
    `fn(f) { f() }` + `#owned` 闭包（闭包内大量临时对象构造/丢弃以触发 GC 与 RC 操作）；
    ② 闭包内再调闭包（重入场景）。
@@ -253,4 +253,4 @@ E1（MoonBit 运行时在外部线程执行闭包的线程安全）对本模块�
 
 ## References
 
-`DECISIONS.md`（本仓库设计决策记录） · `stub/camera2_abi.h`（shim ABI 契约） · `https://docs.oracle.com/en/java/javase/24/docs/specs/jni/invocation.html` · `https://mooncakes.io/docs/Nanaloveyuki/ajni` · NDK `NdkImage.h`
+`DECISIONS.md`（本仓库设计决策记录） · `../stub/camera2_abi.h`（shim ABI 契约） · `https://docs.oracle.com/en/java/javase/24/docs/specs/jni/invocation.html` · `https://mooncakes.io/docs/Nanaloveyuki/ajni` · NDK `NdkImage.h`

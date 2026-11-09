@@ -6,7 +6,7 @@
 /// 真实 JNI / ajni@0.3.6 / 设备取帧（红米电视 720p YUV）留待后续真实对接阶段
 /// （ajni 在 Windows 主机 + 目标设备真机的可用性未实证）。
 ///
-/// 线程与所有权总则（JNI 硬约束，完整决策见 DECISIONS.md
+/// 线程与所有权总则（JNI 硬约束，完整决策见 docs/DECISIONS.md
 /// 「JNI 线程亲和性与回调所有权」「回调投递线程 → owner 线程 marshal」）：
 /// - `JNIEnvPtr` 是线程局部的，禁止缓存、禁止跨线程传递；只缓存 `JavaVMPtr`。
 /// - 原生线程回调前必须 `AttachCurrentThread`，退出前 `DetachCurrentThread`。
@@ -111,7 +111,7 @@ pub(all) struct Camera {
 
 ///|
 /// 相机错误模型（**API 冻结前追认**：`pub(all) suberror`——
-/// 组合根可替换帧源需在包外构造/抛出，见 DECISIONS.md「可替换帧源设计」）。
+/// 组合根可替换帧源需在包外构造/抛出，见 docs/DECISIONS.md「可替换帧源设计」）。
 /// `MarshalReentrant`（R4）：派发期间重入 `Camera::pump_marshal` 被拒绝。
 #derive(Debug)
 pub(all) suberror CameraError {
@@ -140,7 +140,7 @@ pub type FrameCallback = (YuvFrame) -> Unit
 ///|
 /// 帧源契约；`pose` / `yuv` 不依赖本库，组合根决定是否注入相机或文件帧源。
 /// `pub(open)`：供包外实现（文件帧源 / RTSP / 桌面摄像头），可替换帧源设计
-/// 见 DECISIONS.md「可替换帧源设计」。
+/// 见 docs/DECISIONS.md「可替换帧源设计」。
 ///
 /// **方法集已冻结（API 冻结前冻结）**：
 /// - `grab_yuv(Self) -> YuvFrame raise CameraError` —— **接口层不提供超时参数**；
@@ -360,7 +360,7 @@ pub fn Camera::grab_yuv(
 /// `Camera::pump_marshal` 同步派发——每消费一个事件回调恰好执行一次。
 ///
 /// - 跨 C 边界拆为 `FuncRef` 无捕获适配器 + `#owned` 闭包二元组（回调所有权设计
-///   见 DECISIONS.md「JNI 线程亲和性与回调所有权」）；
+///   见 docs/DECISIONS.md「JNI 线程亲和性与回调所有权」）；
 ///   C 侧长期持有闭包，注销/替换/关闭时 `moonbit_decref`，成对不泄漏。
 /// - 每次派发时 thunk 经 `mb_camera2_marshal_next` 拉取暂存帧事件、解析为纯值
 ///   `YuvFrame` 再调用 `cb`；解析失败则本次不调用 `cb`（事件仍被消费，不卡队列）。
