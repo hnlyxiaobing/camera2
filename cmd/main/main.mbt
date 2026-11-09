@@ -1,7 +1,7 @@
 ///|
 /// camera2 桌面冒烟入口：链接并跑通公开 API 全链路（enumerate→open→
 /// start_preview→grab_yuv→close），使 `moon build` 真实校验 shim ABI。
-/// 桌面 stub 环境用假 JavaVM 句柄；R2 由 ajni host bridge 提供真实 `JavaVM*`。
+/// 桌面 stub 环境用假 JavaVM 句柄；后续真实对接阶段由 ajni host bridge 提供真实 `JavaVM*`。
 /// Run with `moon run cmd/main` from the project root.
 
 ///|

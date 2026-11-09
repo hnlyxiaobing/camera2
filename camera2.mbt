@@ -3,9 +3,11 @@
 ///
 /// 本文件：外部句柄声明、`extern "C"` shim 签名、中性帧值类型、公开 API 实现。
 /// 内部解析/映射辅助见 `internal.mbt`；`stub/camera2_stub.c` 为**桌面 stub**——
-/// 真实 JNI / ajni@0.3.6 / 设备取帧（红米电视 720p YUV）留待 R2（open-questions E4）。
+/// 真实 JNI / ajni@0.3.6 / 设备取帧（红米电视 720p YUV）留待后续真实对接阶段
+/// （ajni 在 Windows 主机 + 目标设备真机的可用性未实证）。
 ///
-/// 线程与所有权总则（JNI 硬约束，见 docs/adr/ADR-0009）：
+/// 线程与所有权总则（JNI 硬约束，完整决策见 DECISIONS.md
+/// 「JNI 线程亲和性与回调所有权」）：
 /// - `JNIEnvPtr` 是线程局部的，禁止缓存、禁止跨线程传递；只缓存 `JavaVMPtr`。
 /// - 原生线程回调前必须 `AttachCurrentThread`，退出前 `DetachCurrentThread`。
 /// - 跨回调长期持有的 Java 对象必须用 `NewGlobalRef` / `DeleteGlobalRef` 管理。
@@ -35,7 +37,7 @@ pub type CameraHandleRaw
 pub type ImageReaderRaw
 
 ///|
-/// 相机状态机（**冻结前 P0 决策 5 收紧**：删除未被实际代码路径使用的
+/// 相机状态机（**API 冻结前收紧**：删除未被实际代码路径使用的
 /// `Closed` / `Opening` / `Previewing` / `Failed` 分支，只保留实际构造的
 /// `Open`——`Camera::open` 是唯一写入点，`state` 由 C 侧会话注册表裁决存活，
 /// 不补齐状态机）。
@@ -95,7 +97,7 @@ pub(all) struct CameraConfig {
 
 ///|
 /// MoonBit 侧相机包装值；`handle` 为 C 侧裸指针。
-/// `state` 为打开状态快照（冻结前 P0 决策 5 后仅 `Open`）；重复 open/close 的存活
+/// `state` 为打开状态快照（API 冻结前收紧后仅 `Open`）；重复 open/close 的存活
 /// 裁决由 C 侧会话注册表（`ensure_session`）完成，不依赖该字段的分支。
 pub(all) struct Camera {
   handle : CameraHandleRaw
@@ -106,8 +108,8 @@ pub(all) struct Camera {
 }
 
 ///|
-/// 相机错误模型（**冻结前 P0 决策 4 追认**：`pub(all) suberror`——
-/// 组合根可替换帧源需在包外构造/抛出，ADR-0004）。
+/// 相机错误模型（**API 冻结前追认**：`pub(all) suberror`——
+/// 组合根可替换帧源需在包外构造/抛出，见 DECISIONS.md「可替换帧源设计」）。
 #derive(Debug)
 pub(all) suberror CameraError {
   PermissionDenied(String)
@@ -133,9 +135,10 @@ pub type FrameCallback = (YuvFrame) -> Unit
 
 ///|
 /// 帧源契约；`pose` / `yuv` 不依赖本库，组合根决定是否注入相机或文件帧源。
-/// `pub(open)`：供包外实现（文件帧源 / RTSP / 桌面摄像头），ADR-0004 可替换性。
+/// `pub(open)`：供包外实现（文件帧源 / RTSP / 桌面摄像头），可替换帧源设计
+/// 见 DECISIONS.md「可替换帧源设计」。
 ///
-/// **方法集已冻结（冻结前 P0 决策 3，方案 A）**：
+/// **方法集已冻结（API 冻结前冻结）**：
 /// - `grab_yuv(Self) -> YuvFrame raise CameraError` —— **接口层不提供超时参数**；
 ///   超时策略由具体帧源实现自行定义（如 `Camera::grab_yuv(self, timeout_ms)`、
 ///   文件帧源可无限等待）。冻结后给 trait 方法加参数即破坏性变更。
@@ -146,12 +149,12 @@ pub(open) trait FrameSource {
 }
 
 ///|
-/// ---- 外部 C shim 声明（**包私有，非公共 API**；冻结前 P0 决策 6）----
-/// 符号由 `stub/camera2_stub.c`（桌面 stub，本轮）提供；
-/// R2 起由 Java 侧 + 真实 JNI `native-stub` 提供同名符号。
+/// ---- 外部 C shim 声明（**包私有，非公共 API**；API 冻结前移出公开面）----
+/// 符号由 `stub/camera2_stub.c`（桌面 stub，当前阶段）提供；
+/// 后续真实对接阶段由 Java 侧 + 真实 JNI `native-stub` 提供同名符号。
 /// 可见性：9 个 `mb_camera2_*` 均为**私有实现 ABI**（不再出现在公开快照），
 /// MoonBit 层只经 `Camera::{open,start_preview,grab_yuv,on_frame,clear_on_frame,close}`
-/// 与 `enumerate_cameras` 调用；符号名与签名不变，R2 对接无需改 ABI。
+/// 与 `enumerate_cameras` 调用；符号名与签名不变，真实对接无需改 ABI。
 /// ABI：Int→int32_t、UInt64→uint64_t、Unit→void、Bytes/FixedArray[Byte]→uint8_t*、
 /// #external→void*、FuncRef→函数指针、`() -> Unit` 闭包→MoonBit 对象指针。
 
@@ -233,9 +236,10 @@ extern "C" fn mb_camera2_close(
 /// - 错误：权限、设备不存在、尺寸/格式不支持、JNI 线程未 attach、会话占用均以
 ///   `CameraError` 传播（C status → CameraError 映射，见 `internal.mbt`）。
 /// - 线程：必须在 JNI session 的 owner 线程调用；`Camera` 绑定到 `owner_thread_id`。
-/// - 状态机：句柄存活状态由 C 侧会话注册表裁决（本值类型字段不可变，见报告偏差）。
+/// - 状态机：句柄存活状态由 C 侧会话注册表裁决（本值类型字段不可变）。
 /// - 非目标：不做推理、不做渲染、不做 YUV→RGB 转换、不实现权限 UI。
-/// - 桌面 stub：真实 Java Camera2 样板 / ajni host bridge / 权限流程留待 R2（E4）。
+/// - 桌面 stub：真实 Java Camera2 样板 / ajni host bridge / 权限流程留待后续真实
+///   对接阶段（ajni 真机可用性未实证）。
 pub fn Camera::open(
   vm : JavaVMPtr,
   config : CameraConfig,
@@ -329,7 +333,8 @@ pub fn Camera::grab_yuv(
 ///|
 /// 注册帧回调。回调必须浅拷贝帧数据并 marshal 到 owner 线程，不得在回调内做 JNI 调用。
 ///
-/// - 跨 C 边界拆为 `FuncRef` 无捕获适配器 + `#owned` 闭包二元组（ADR-0009）；
+/// - 跨 C 边界拆为 `FuncRef` 无捕获适配器 + `#owned` 闭包二元组（回调所有权设计
+///   见 DECISIONS.md「JNI 线程亲和性与回调所有权」）；
 ///   C 侧长期持有闭包，注销/替换/关闭时 `moonbit_decref`，成对不泄漏。
 /// - 每次投递时 thunk 同步取一帧（acquire→release，浅拷贝为纯值）再调用 `cb`；
 ///   取帧失败则本次不调用 `cb`。

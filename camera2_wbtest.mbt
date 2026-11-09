@@ -5,7 +5,7 @@
 // 本文件覆盖：全链路、状态机（未 open 拒绝 / 重复 close）、缓冲池耗尽与
 // acquire→release 归还、可配置帧序列、三平面 stride 描述与非紧凑 padding、
 // 回调注册/触发/注销后不再触发、#owned 闭包 set/clear 成对、错误映射、
-// 解析校验。回调线程约束按 ADR-0009：stub 可从独立投递线程调回调，
+// 解析校验。回调线程约束（JNI 线程设计，见 DECISIONS.md）：stub 可从独立投递线程调回调，
 // MoonBit 侧断言投递线程 ≠ owner 线程（用户回调须自行 marshal 到 owner 线程）。
 
 ///|
@@ -404,7 +404,7 @@ test "callback fires on delivery thread and stops after clear_on_frame" {
   stub_sleep(150)
   stub_quiesce() // 等投递排空（C 侧休眠，不动 MoonBit RC）
   assert_true(calls[0] >= 1)
-  // ADR-0009：回调在投递线程触发，≠ owner 线程；用户回调须 marshal 到 owner 线程
+  // 回调在投递线程触发，≠ owner 线程；用户回调须 marshal 到 owner 线程（见 DECISIONS.md）
   assert_true(tids[0] != mb_camera2_current_thread_id())
   Camera::clear_on_frame(cam)
   let before = calls[0]

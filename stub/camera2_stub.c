@@ -1,8 +1,8 @@
 /*
- * camera2 desktop stub —— Java Camera2 / JNI 的桌面替身（实现轮 R1.5）。
+ * camera2 desktop stub —— Java Camera2 / JNI 的桌面替身（桌面 stub 阶段）。
  *
- * ⚠ 桌面 stub，真实 JNI / ajni@0.3.6 / 设备取帧（红米电视 720p YUV）留待 R2，
- *   见 docs/open-questions.md E4。本文件只模拟：
+ * ⚠ 桌面 stub，真实 JNI / ajni@0.3.6 / 设备取帧（红米电视 720p YUV）留待后续
+ *   真实对接阶段——ajni 在 Windows 主机 + 目标设备真机的可用性未实证。本文件只模拟：
  *   - JavaVM 缓存（mb_camera2_init）与线程局部 JNIEnv 约定（unattached 注入点）；
  *   - 假设备枚举（4 台：id 0/1/2/3，含一台不支持 YUV_420_888）；
  *   - 相机会话句柄 + ImageReader 缓冲池（max_buffers 张在飞即耗尽）；

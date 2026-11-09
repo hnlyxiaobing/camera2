@@ -1,10 +1,10 @@
 # camera2 · 公开 API（API.md）
 
-> **冻结前 P0 整改后（R2 准备轮）**。`preferred_target = "native"`，错误传播统一 `raise CameraError`。
+> **API 冻结前整改后**。`preferred_target = "native"`，错误传播统一 `raise CameraError`。
 > MoonBit 侧 API **全部已实现**（桌面 C stub 双路径），无 `declare` 残留、无 `0068` 告警。
-> 快照 `pkg.generated.mbti` 已由工具链（`rr_moon_pkg`）在 `moon check` / `moon build` 时**自动同步**为
-> 本轮 P0 后公开面（9 个 `mb_camera2_*` shim 消失、`CameraState` 收紧为 `Open` 等）；
-> 本子代理**未运行 `moon info`**，最终快照审阅由主控统一执行。
+> 快照 `pkg.generated.mbti` 由工具链在 `moon check` / `moon build` 时**自动同步**为
+> 整改后公开面（9 个 `mb_camera2_*` shim 消失、`CameraState` 收紧为 `Open` 等）；
+> 手工刷新可运行 `moon info`。
 
 ## 外部句柄（`#external` = C `void*`）
 
@@ -18,9 +18,9 @@
 
 ## 外部 C shim（9 个 · **私有实现 ABI，非公共 API**）
 
-> **冻结前 P0 决策 6**：9 个 `mb_camera2_*` 全部改为**包私有**，不再出现在公开 API / 快照；
+> **API 冻结前整改**：9 个 `mb_camera2_*` 全部改为**包私有**，不再出现在公开 API / 快照；
 > 实现与内部调用（`Camera::{open,start_preview,grab_yuv,on_frame,clear_on_frame,close}`、
-> `enumerate_cameras`）全部保留，符号名与签名不变，R2 真实 JNI 对接无需改 ABI。
+> `enumerate_cameras`）全部保留，符号名与签名不变，后续真实 JNI 对接无需改 ABI。
 > 黑盒测试不直接调用 shim；直接调用的白盒用例留在 `camera2_wbtest.mbt`。
 > 下表仅作**内部 ABI 文档**，不构成公共 API 承诺。
 
@@ -40,13 +40,13 @@
 
 `Camera` · `CameraState` · `CameraConfig` · `CameraInfo` · `FrameSize` · `Facing` · `YuvFrame` · `YuvPlane` · `CameraError`（**`pub(all) suberror`**，12 个构造）· `FrameCallback` · `FrameSource`(trait)。
 
-- **决策 4（追认）**：`CameraError` 为 `pub(all) suberror`——包外可构造/匹配/抛出
-  （组合根替换帧源需要，ADR-0004）。R1 起即如此，冻结前正式追认，冻结后改回 `pub` 即破坏性变更。
-- **决策 5（收紧）**：`CameraState` 删除未被实际代码路径使用的 `Closed` / `Opening` /
+- **追认（错误可见性）**：`CameraError` 为 `pub(all) suberror`——包外可构造/匹配/抛出
+  （组合根替换帧源需要，见 `DECISIONS.md`「可替换帧源设计」）。初版起即如此，冻结前正式追认，冻结后改回 `pub` 即破坏性变更。
+- **收紧（状态机）**：`CameraState` 删除未被实际代码路径使用的 `Closed` / `Opening` /
   `Previewing` / `Failed` 分支，收紧为实际使用的 **`Open`**（`Camera::open` 是唯一写入点；
   存活裁决在 C 侧会话注册表）。属允许的「删除死接口」类公开面变化，冻结后恢复分支即破坏性变更。
 
-### `FrameSource` 方法集（**已冻结 · 决策 3 方案 A**）
+### `FrameSource` 方法集（**已冻结**，见 `DECISIONS.md`「可替换帧源设计」）
 
 ```moonbit
 pub(open) trait FrameSource {
@@ -80,7 +80,7 @@ pub(open) trait FrameSource {
 
 ## 状态与已知阻塞
 
-**冻结前 P0 整改（R2 准备轮）实跑**：`moon clean` / `moon check --deny-warn` / `moon build` /
+**API 冻结前整改实跑**：`moon clean` / `moon check --deny-warn` / `moon build` /
 `moon test`（21 测试全过）/ `moon fmt --check` 全部 exit 0（桌面 C stub 环境）。
-真实 JNI / Java 样板 / ajni / 设备取帧留待 **R2**（open-questions E4）；本轮保持项目内 C stub 双路径，
-未链接/下载任何外部库。API 快照：`pkg.generated.mbti`（工具链已自动同步至本轮 P0 后公开面，待主控终审）。
+真实 JNI / Java 样板 / ajni / 设备取帧排**后续真实对接阶段**（ajni 真机可用性未实证，见 README「风险与待验证」）；当前保持项目内 C stub 双路径，
+未链接/下载任何外部库。API 快照：`pkg.generated.mbti`（由工具链自动同步至整改后公开面）。
