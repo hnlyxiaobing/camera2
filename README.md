@@ -3,7 +3,7 @@
 **Android Camera2 的 JNI 封装 —— 权限、打开、预览 Surface、ImageReader 取 YUV 与关闭的完整相机生命周期。**
 
 > 状态：**实现完成（2026-11-07，桌面 stub 阶段）+ R4 E1 回调 marshal 层（2026-11-09）**。全部导出接口已实现，`moon build` / `moon test` 全绿（**30 测试**，`0068` 清零）。本阶段自带**桌面 C stub**（`stub/camera2_stub.c`）模拟 JavaVM/ImageReader/相机会话；**真实 JNI / Java 样板 / ajni / 设备取帧留待后续真实对接阶段**（ajni 在 Windows 主机 + 目标设备真机的可用性未实证，见「风险与待验证」）。
-> **R4 E1（回调线程安全）**：帧回调投递线程**不再直接执行 MoonBit 闭包**——改为「投递线程浅拷贝入 C 侧有界 marshal 队列 → owner 线程 `Camera::pump_marshal` 同步派发」（ADR-0009）。重入 pump 返回 `MarshalReentrant`；关闭竞态由 C 侧延迟释放收敛。并发/重入/满队列/关闭竞态白盒测试已绿；**Linux pthread 原实验（无捕获 FuncRef / `#owned` 闭包反复调用）在本机 Windows 无法执行，仍 [仍需实测]**（最小实验方案见 `docs/DESIGN.md` §14）。
+> **R4 E1（回调线程安全）**：帧回调投递线程**不再直接执行 MoonBit 闭包**——改为「投递线程浅拷贝入 C 侧有界 marshal 队列 → owner 线程 `Camera::pump_marshal` 同步派发」（本仓库回调 marshal 决策）。重入 pump 返回 `MarshalReentrant`；关闭竞态由 C 侧延迟释放收敛。并发/重入/满队列/关闭竞态白盒测试已绿；**Linux pthread 原实验（无捕获 FuncRef / `#owned` 闭包反复调用）在本机 Windows 无法执行，仍 [仍需实测]**（最小实验方案见 `docs/DESIGN.md` §14）。
 > **API 冻结前整改已落实**：`FrameSource` 方法集冻结（`grab_yuv(Self)`，trait 层无超时参数，超时策略由具体帧源实现自行定义）· `CameraError` 追认 `pub(all) suberror` · `CameraState` 收紧为 `Open` 单分支 · 9 个 `mb_camera2_*` shim 移出公开 API（包私有，私有实现 ABI）· `close` 幂等措辞统一为「不会二次释放，重复调用返回明确错误」。门禁 `moon clean` / `moon check --deny-warn` / `moon build` / `moon test` / `moon fmt --check` 全绿。
 > `preferred_target` 已由 `wasm` 改为 `native`（唯一配置改动，理由见 `docs/DECISIONS.md`「preferred_target 由 wasm 改为 native」）。
 

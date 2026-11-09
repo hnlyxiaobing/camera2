@@ -1,9 +1,9 @@
 # ============================================================================
-# WP-F · 模块级 CI workflow 模板（native 目标模块用）
+# 本仓库 CI workflow（native 目标）
 #
-# 由 .workbuddy/wp-f-gen-ci.ps1 展开到 4 个 native 模块的 .github/workflows/ci.yml。
+# 本文件是本仓库唯一的 CI 定义，由 push / pull_request / workflow_dispatch 触发。
 # 模块是独立 git 仓库，workflow 必须放在模块内 .github/workflows/ 才会被 GitHub Actions 触发。
-# 根目录 .github/workflows/ci.yml 只是规范/汇总模板：根目录虽已初始化本地 git 仓库（无 GitHub remote），GitHub Actions 仍不会读取或执行本文件。
+# 本仓库是独立发布单元，不存在仓库外的 CI 定义或汇总模板。
 #
 # 五道门禁（顺序执行，任一步非 0 即整 job 失败）：
 #   1. moon check --deny-warn
@@ -17,13 +17,13 @@
 #        快照不受本仓库版本控制，二者均不在 diff 范围。）
 # （可选 moon clean：仅清理，continue-on-error，不参与判定）
 #
-# 工具链钉死（根目录 VERSION-LOCK.md）：
+# 本仓库锁定的工具链版本：
 #   moon    0.1.20261104
 #   moonc   v0.10.20+65efd5b93
 #   moonrun 0.1.20261104
 #   core    0.10.20+65efd5b93（以 ~/.moon/lib/core/moon.mod 为准）
 #
-# 依赖策略（ADR-0010）：
+# 本仓库依赖策略：
 #   - 禁止无版本 `moon update`：`moon update --help` 实测只有 --target-dir/-q/-v/--trace/--dry-run，
 #     没有任何锁定版本的参数，因此 CI 中一律不出现 `moon update`。
 #   - 依赖只按各模块 moon.mod 中已钉死的版本声明（例：bobzhang/zip@0.1.2）由 check/build 自动同步。
@@ -53,10 +53,9 @@ jobs:
     name: five-gates (camera2)
     runs-on: ubuntu-latest
     # 本模块 preferred_target = "native"：build/test 走 native 后端，链接项目内 C stub
-    # （stub 例外，真实库对接留 R2，按门禁分阶段解禁，见 ADR-0007）。
+    # （stub 例外；真实库对接按本仓库门禁分阶段解禁）。
     # CI runner 是 ubuntu-latest（用系统 cc 链接），该路径 [仍需实测]；Windows/MSVC x86_64
-    # 主机上的同序实跑证据见根目录 .workbuddy/wp-f-ci-local-run.txt（[已复验-本地等价]，
-    # 那是本机等价实跑，不是 GitHub Actions 已跑通）。
+    # 本机同序实跑已通过（[已复验-本地等价]），不等同于 GitHub Actions 云上实跑。
     steps:
       - name: Checkout camera2
         uses: actions/checkout@v5
@@ -122,7 +121,7 @@ jobs:
           set -euo pipefail
           moon info
           if ! git diff --exit-code -- pkg.generated.mbti cmd/main/pkg.generated.mbti; then
-            echo "::error::Gate 5/5 failed: pkg.generated.mbti snapshot out of sync with sources. Run 'moon info' locally and commit the regenerated snapshot together with the API change (additive changes also require an API-CHANGELOG.md entry; freeze policy: COMPATIBILITY.md)."
+            echo "::error::Gate 5/5 failed: pkg.generated.mbti snapshot out of sync with sources. Run 'moon info' locally and commit the regenerated snapshot together with the API change (additive changes also require a regenerated snapshot and an API-change note in this repository's docs/API.md)."
             exit 1
           fi
           echo "Gate 5/5 OK: snapshot in sync (pkg.generated.mbti + cmd/main/pkg.generated.mbti)"

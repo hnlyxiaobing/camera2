@@ -117,7 +117,7 @@ shim 移出公开 API、close 幂等措辞统一（汇总见 `DECISIONS.md`「AP
 
 ## 14. 回调 marshal 层设计（R4：投递线程 → owner 线程）
 
-> ADR-0009「线程与回调所有权」Decision 4 的落地机制。实现 = `../stub/camera2_stub.c` marshal
+> 本仓库「回调 marshal 到 owner 线程」决策的落地机制。实现 = `../stub/camera2_stub.c` marshal
 > 队列 + `mb_camera2_marshal_pump` / `mb_camera2_marshal_next` + `Camera::pump_marshal`
 > + `Camera::on_frame` thunk；测试白盒清单见 `../camera2_wbtest.mbt`。
 
@@ -200,8 +200,8 @@ E1（MoonBit 运行时在外部线程执行闭包的线程安全）对本模块�
   闭包**）；owner 线程 `pump_marshal` 派发语义不变。
 - 生命周期：`NewGlobalRef` 持有 `CameraDevice` / `CameraCaptureSession` / `ImageReader` /
   `Surface` Java 对象；`mb_camera2_close` 逆序 `DeleteGlobalRef` + close；native 线程
-  attach / detach 状态由 C 侧管理（ADR-0009 Decision 1/2）。
-- 入库红线：真实 `.so` / devkit 不入库（ADR-0011 口径），本地链接 + SHA-256 +
+  attach / detach 状态由 C 侧管理。
+- 入库红线：真实 `.so` / devkit 不入库，本地链接 + SHA-256 +
   PROVENANCE 登记；`../stub/camera2_stub.c` 保持可移植桌面回退。
 
 ### 15.2 Java Camera2 样板（约 200 行，设计预留）
@@ -218,7 +218,7 @@ E1（MoonBit 运行时在外部线程执行闭包的线程安全）对本模块�
 ### 15.3 `ajni@0.3.6` host bridge（可选依赖，五条门槛评估后引入）
 
 - 角色：host 侧 JavaVM 获取 / Attach 管理 + 类型安全 JNI 转发；其契约
-  （`Cache JavaVM, never JNIEnv`、global ref 归 C 持有）与 ADR-0009 一致。
+  （`Cache JavaVM, never JNIEnv`、global ref 归 C 持有）与此处线程契约一致。
 - 门槛（DECISIONS.md §4）：0.x 无稳定承诺、"Windows/macOS desktop ABI support is not
   claimed"、目标设备（Android 9 / armeabi-v7a）未实证——引入前须 E4 实机验证 +
   用途/许可/维护/平台/风险五条评估。
@@ -228,14 +228,14 @@ E1（MoonBit 运行时在外部线程执行闭包的线程安全）对本模块�
 ## 16. E1 最小实验方案（**[仍需实测]**，Linux x86-64 native 口径）
 
 **目标**：验证 MoonBit 运行时（GC、引用计数、重入）在非 MoonBit 线程上执行无捕获
-`FuncRef` 与 `#owned` 闭包的线程安全（`../../docs/open-questions.md` E1，P0）。
+`FuncRef` 与 `#owned` 闭包的线程安全（本仓库 E1 回调线程安全验证项，P0）。
 
-**环境**：Linux x86-64；`moon 0.1.20261104` / `moonc v0.10.20+65efd5b93`（`../../VERSION-LOCK.md`
+**环境**：Linux x86-64；`moon 0.1.20261104` / `moonc v0.10.20+65efd5b93`（本仓库锁定的工具链版本
 口径）；`preferred_target = "native"`；GCC 或 Clang + pthread。
 
 **步骤（最小可执行）**：
 
-1. 一次性探针模块（不入 11 模块仓库）：`../moon.mod` `preferred_target = "native"`，
+1. 一次性探针模块（不纳入本仓库）：`../moon.mod` `preferred_target = "native"`，
    `../moon.pkg` `native-stub` 指向 pthread C 文件（模式照抄 `../stub/camera2_stub.c`）。
 2. C 侧起 4 个 pthread，每个反复（≥ 10⁶ 次）调用两类目标：① 无捕获 `FuncRef` 适配器
    `fn(f) { f() }` + `#owned` 闭包（闭包内大量临时对象构造/丢弃以触发 GC 与 RC 操作）；

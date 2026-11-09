@@ -7,7 +7,7 @@
 // 回调注册/派发/注销后不再触发、#owned 闭包 set/clear 成对、错误映射、
 // 解析校验，以及 **R4 marshal 层**并发/竞态/错误路径（多线程投递、
 // 重入调用、乱序/满队列、关闭竞态、投递后释放）。
-// 回调线程契约（ADR-0009，见 docs/DECISIONS.md「回调投递线程 → owner 线程 marshal」）：
+// 回调线程契约（本仓库线程与回调所有权决策，见 docs/DECISIONS.md「回调投递线程 → owner 线程 marshal」）：
 // 投递线程（threaded 模式独立线程）只做浅拷贝入队、绝不执行 MoonBit 闭包；
 // 闭包只由 owner 线程 `Camera::pump_marshal` 派发（断言回调线程 == owner 线程）。
 

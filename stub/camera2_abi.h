@@ -14,7 +14,7 @@
  *   FuncRef[(() -> Unit) -> Unit] -> void (*)(void*),
  *   () -> Unit（闭包）-> void*（MoonBit 对象，RC 由 C 侧管理）。
  *
- * 线程角色（ADR-0009）：
+ * 线程角色：
  *   - owner 线程 = 创建 JNI session 的线程（Camera.owner_thread_id）：
  *     所有 MoonBit 闭包**只在 owner 线程执行**（经 mb_camera2_marshal_pump）。
  *   - 投递线程 = 相机/ImageReader 回调线程（threaded stub 的独立线程）：
@@ -84,7 +84,7 @@ int32_t mb_camera2_set_frame_callback(void *reader, void (*cb)(void *),
 void mb_camera2_clear_frame_callback(void *reader);
 void mb_camera2_close(void *camera, void *reader);
 
-/* ---------------- 回调 marshal 层（R4，ADR-0009） ---------------- */
+/* ---------------- 回调 marshal 层（R4，本仓库线程与回调所有权决策） ---------------- */
 int32_t mb_camera2_marshal_pump(void *reader, int32_t max_events);
 int32_t mb_camera2_marshal_next(void *reader, uint8_t *dst, int32_t capacity);
 

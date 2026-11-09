@@ -1,9 +1,9 @@
 # Reference: https://docs.github.com/en/copilot/how-tos/use-copilot-agents/coding-agent/customize-the-agent-environment
 #
-# WP-F 修订（R2 准备轮）：
+# 工具链版本锁定说明：
 #   1) 安装 MoonBit 由「无版本 latest」改为「钉死 0.1.20261104 + 版本断言」；
 #   2) 删除无版本的 `moon update`（`moon update --help` 实测只有 --target-dir/-q/-v/--trace/--dry-run，
-#      没有任何锁定版本的参数，不满足本轮「禁用无版本 moon update」要求）；
+#      没有任何锁定版本的参数，不满足锁定版本要求）；
 #      依赖改为按 moon.mod 中钉死的版本声明（例 bobzhang/zip@0.1.2）由 build 自动同步获取；
 #   3) 真正的四道门禁（check --deny-warn → build → test → fmt --check）在同目录 ci.yml。
 name: "Copilot Setup Steps"

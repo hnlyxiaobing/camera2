@@ -10,7 +10,7 @@
  *   - 帧回调二元组 (FuncRef + #owned closure)：保存、成对持有/释放，
  *     注销/替换/关闭时 moonbit_decref；每次调用前 moonbit_incref（callee 按
  *     owned 约定在作用域末 decref 一次）；
- *   - **回调 marshal 层（R4，ADR-0009「线程与回调所有权」）**：投递线程
+ *   - **回调 marshal 层（R4，本仓库线程与回调所有权决策）**：投递线程
  *     （threaded 模式的独立线程）**只做浅拷贝入队**——打包帧 malloc 副本入
  *     有界 marshal 队列（满则丢最旧 + 计数），**绝不执行 MoonBit 闭包**；
  *     闭包只由 owner 线程 `mb_camera2_marshal_pump` 同步派发（每事件一次）。
@@ -151,7 +151,7 @@ typedef struct {
   int32_t max_buffers;
 } cam_t;
 
-/* marshal 事件：打包帧 malloc 副本 + 入队线性化序号（R4，ADR-0009） */
+/* marshal 事件：打包帧 malloc 副本 + 入队线性化序号（R4，本仓库线程与回调所有权决策） */
 typedef struct {
   uint8_t *payload;
   int32_t len;
@@ -329,7 +329,7 @@ static void fill_frame(uint8_t *out, const reader_t *r, int32_t k) {
   fill_plane(vp, c_rows, c_rs, 2, w / 2, k, 2);
 }
 
-/* ---------------- 回调 marshal 队列（R4，ADR-0009） ----------------
+/* ---------------- 回调 marshal 队列（R4，本仓库线程与回调所有权决策） ----------------
  * 投递线程只做浅拷贝入队（marshal_push_locked），绝不执行 MoonBit 闭包；
  * 闭包由 owner 线程 mb_camera2_marshal_pump 派发（mb_camera2_marshal_next
  * 拉取暂存事件）。所有队列操作持全局递归锁。 */
@@ -971,7 +971,7 @@ done:
   return st;
 }
 
-/* ================= 回调 marshal 层（R4，ADR-0009） ================= */
+/* ================= 回调 marshal 层（R4，本仓库线程与回调所有权决策） ================= */
 
 /* owner 线程 pump：同步派发 marshal 队列中的帧回调。
  * - 每事件恰好调用一次已注册二元组 (cb, closure)（owned 调用约定：调用前
