@@ -4,9 +4,12 @@
 //
 // 本文件覆盖：全链路、状态机（未 open 拒绝 / 重复 close）、缓冲池耗尽与
 // acquire→release 归还、可配置帧序列、三平面 stride 描述与非紧凑 padding、
-// 回调注册/触发/注销后不再触发、#owned 闭包 set/clear 成对、错误映射、
-// 解析校验。回调线程约束（JNI 线程设计，见 DECISIONS.md）：stub 可从独立投递线程调回调，
-// MoonBit 侧断言投递线程 ≠ owner 线程（用户回调须自行 marshal 到 owner 线程）。
+// 回调注册/派发/注销后不再触发、#owned 闭包 set/clear 成对、错误映射、
+// 解析校验，以及 **R4 marshal 层**并发/竞态/错误路径（多线程投递、
+// 重入调用、乱序/满队列、关闭竞态、投递后释放）。
+// 回调线程契约（ADR-0009，见 DECISIONS.md「回调投递线程 → owner 线程 marshal」）：
+// 投递线程（threaded 模式独立线程）只做浅拷贝入队、绝不执行 MoonBit 闭包；
+// 闭包只由 owner 线程 `Camera::pump_marshal` 派发（断言回调线程 == owner 线程）。
 
 ///|
 /// ---- 桌面 stub 测试替身控制（非 pub extern，仅测试期使用）----
@@ -67,6 +70,18 @@ extern "C" fn stub_sleep(ms : Int32) -> Unit = "mb_camera2_stub_sleep"
 
 ///|
 extern "C" fn stub_quiesce() -> Unit = "mb_camera2_stub_quiesce"
+
+///|
+extern "C" fn stub_marshal_pending(reader : ImageReaderRaw) -> Int32 = "mb_camera2_stub_marshal_pending"
+
+///|
+extern "C" fn stub_marshal_dropped(reader : ImageReaderRaw) -> Int32 = "mb_camera2_stub_marshal_dropped"
+
+///|
+extern "C" fn stub_marshal_pushed(reader : ImageReaderRaw) -> Int32 = "mb_camera2_stub_marshal_pushed"
+
+///|
+extern "C" fn stub_marshal_live_events() -> Int32 = "mb_camera2_stub_marshal_live_events"
 
 ///|
 /// ---- 测试辅助 ----
@@ -237,19 +252,22 @@ test "full chain: enumerate -> open -> preview -> on_frame -> grab -> clear -> c
     seen.push(frame)
   })
   assert_eq(stub_live_closures(), 1)
-  assert_eq(stub_produce(cam.reader), 0) // 投递第 0 帧
+  assert_eq(stub_produce(cam.reader), 0) // 投递第 0 帧（浅拷贝入 marshal 队列）
+  assert_eq(hits[0], 0) // 未 pump 前闭包不执行（投递线程不跑 MoonBit 闭包）
+  assert_eq(Camera::pump_marshal(cam, 8), 1) // owner 线程 pump 派发
   assert_eq(hits[0], 1)
   assert_eq(seen.length(), 1)
   check_frame(seen[0], 0, 320, 240, "callback frame")
-  assert_eq(stub_inflight(cam.reader), 0) // 回调路径 acquire→release 已归还
+  assert_eq(stub_inflight(cam.reader), 0) // 回调路径不占缓冲池（投递侧浅拷贝）
   let frame = Camera::grab_yuv(cam, 100) // 同步路径自动产第 1 帧
   check_frame(frame, 1, 320, 240, "grabbed frame")
   assert_eq(stub_inflight(cam.reader), 0) // 每帧缓冲均归还
   Camera::clear_on_frame(cam)
   assert_eq(stub_live_closures(), 0)
   let before = hits[0]
-  assert_eq(stub_produce(cam.reader), 0) // 注销后投递
+  assert_eq(stub_produce(cam.reader), 0) // 注销后投递（无回调：入 pending）
   assert_eq(stub_callback_calls(cam.reader), 0) // C 侧不再派发（clear 已清零）
+  assert_eq(Camera::pump_marshal(cam, 8), 0) // marshal 队列已空
   assert_eq(hits[0], before) // 注销后不再触发
   Camera::close(cam)
   assert_eq(stub_live_cameras(), 0)
@@ -388,31 +406,38 @@ test "three-plane stride descriptors and non-compact padding are correct" {
 }
 
 ///|
-test "callback fires on delivery thread and stops after clear_on_frame" {
+test "callback is marshalled to the owner thread; delivery thread only enqueues" {
   stub_reset()
-  stub_set_threaded(1) // 独立投递线程（模拟相机投递线程）
+  stub_set_threaded(1) // 独立投递线程（模拟相机投递线程，只浅拷贝入队）
   stub_set_frame_interval_ms(5)
   let vm = stub_fake_vm()
   let cam = Camera::open(vm, test_config("0", 320, 240, 2))
-  Camera::start_preview(cam)
   let calls : Array[Int32] = [0]
   let tids : Array[UInt64] = [0UL]
   Camera::on_frame(cam, fn(_f) {
     calls[0] = calls[0] + 1
     tids[0] = mb_camera2_current_thread_id()
   })
-  stub_sleep(150)
-  stub_quiesce() // 等投递排空（C 侧休眠，不动 MoonBit RC）
+  Camera::start_preview(cam) // 投递线程开始入队
+  for _ in 0..<30 {
+    ignore(Camera::pump_marshal(cam, 8)) // owner 线程 pump 派发
+    stub_sleep(10)
+  }
+  stub_quiesce()
   assert_true(calls[0] >= 1)
-  // 回调在投递线程触发，≠ owner 线程；用户回调须 marshal 到 owner 线程（见 DECISIONS.md）
-  assert_true(tids[0] != mb_camera2_current_thread_id())
+  // 闭包只在 owner（pump 调用线程）执行；投递线程绝不执行 MoonBit 闭包
+  assert_eq(tids[0], mb_camera2_current_thread_id())
   Camera::clear_on_frame(cam)
   let before = calls[0]
-  stub_sleep(120)
+  for _ in 0..<15 {
+    ignore(Camera::pump_marshal(cam, 8)) // 注销后 pump 丢弃排水
+    stub_sleep(10)
+  }
   stub_quiesce()
   assert_eq(calls[0], before) // 注销后不再触发
   Camera::close(cam) // join 投递线程并释放
   assert_eq(stub_live_closures(), 0)
+  assert_eq(stub_marshal_live_events(), 0) // 队列事件随 close 全部释放
 }
 
 ///|
@@ -428,9 +453,10 @@ test "callback set/clear pairing owns and releases the closure" {
   Camera::on_frame(cam, fn(_) { seen2[0] = seen2[0] + 1 }) // 重复注册：替换并释放旧闭包
   assert_eq(stub_live_closures(), 1)
   assert_eq(stub_produce(cam.reader), 0)
+  assert_eq(Camera::pump_marshal(cam, 4), 1) // owner 线程 pump 派发
   assert_eq(seen1[0], 0) // 旧回调不再触发
   assert_eq(seen2[0], 1)
-  assert_eq(stub_inflight(cam.reader), 0) // 回调取帧后归还
+  assert_eq(stub_inflight(cam.reader), 0) // 回调路径不占缓冲池（投递侧浅拷贝）
   Camera::clear_on_frame(cam)
   assert_eq(stub_live_closures(), 0)
   Camera::clear_on_frame(cam) // 幂等 no-op
@@ -694,4 +720,296 @@ test "parse_camera_infos rejects malformed enumeration buffers" {
     "bad facing",
   )
   assert_true(e3 is CameraError::UnsupportedFormat(_))
+}
+
+///|
+/// ---- R4 marshal 层：并发 / 竞态 / 错误路径 ----
+
+///|
+test "marshal: pump dispatches queued frames on the owner thread in FIFO order" {
+  stub_reset()
+  let vm = stub_fake_vm()
+  let cam = Camera::open(vm, test_config("0", 320, 240, 2))
+  Camera::start_preview(cam)
+  let tids : Array[UInt64] = []
+  let seen : Array[YuvFrame] = []
+  Camera::on_frame(cam, fn(f) {
+    tids.push(mb_camera2_current_thread_id())
+    seen.push(f)
+  })
+  assert_eq(stub_produce(cam.reader), 0) // 3 帧只入队
+  assert_eq(stub_produce(cam.reader), 0)
+  assert_eq(stub_produce(cam.reader), 0)
+  assert_eq(stub_marshal_pending(cam.reader), 3)
+  assert_eq(seen.length(), 0) // 未 pump 前闭包不执行
+  assert_eq(Camera::pump_marshal(cam, 8), 3)
+  assert_eq(seen.length(), 3)
+  check_frame(seen[0], 0, 320, 240, "marshal frame 0")
+  check_frame(seen[1], 1, 320, 240, "marshal frame 1")
+  check_frame(seen[2], 2, 320, 240, "marshal frame 2")
+  // FIFO = 线性化顺序：时间戳严格递增
+  assert_true(seen[0].timestamp_ns < seen[1].timestamp_ns)
+  assert_true(seen[1].timestamp_ns < seen[2].timestamp_ns)
+  // 闭包全部在 owner（本测试线程）执行
+  for t in tids {
+    assert_eq(t, mb_camera2_current_thread_id())
+  }
+  assert_eq(Camera::pump_marshal(cam, 8), 0) // 队列已空
+  Camera::close(cam)
+  assert_eq(stub_marshal_live_events(), 0)
+}
+
+///|
+test "marshal: multi-thread delivery is fully accounted (dispatched + dropped + queued)" {
+  stub_reset()
+  stub_set_threaded(1) // 投递线程只入队
+  stub_set_frame_interval_ms(5)
+  let vm = stub_fake_vm()
+  let cam = Camera::open(vm, test_config("0", 320, 240, 2))
+  let calls : Array[Int32] = [0]
+  Camera::on_frame(cam, fn(_f) { calls[0] = calls[0] + 1 })
+  stub_set_frame_count(20) // 投递预算恰好 20 帧（先设预算再开投递）
+  Camera::start_preview(cam)
+  let mut rounds = 0
+  for _ in 0..<100 {
+    ignore(Camera::pump_marshal(cam, 16))
+    stub_sleep(5)
+    rounds = rounds + 1
+    if stub_marshal_pushed(cam.reader) >= 20 {
+      break
+    }
+  }
+  assert_true(rounds < 100) // 未打满等待上限（防挂死）
+  ignore(Camera::pump_marshal(cam, 16)) // 排空
+  let pushed = stub_marshal_pushed(cam.reader)
+  let dropped = stub_marshal_dropped(cam.reader)
+  assert_eq(pushed, 20) // 预算恰好 20，无多投
+  assert_eq(stub_marshal_pending(cam.reader), 0) // 已排空
+  // 每个事件有归属：派发 / 满队列丢弃 / 在队（此处为 0）
+  assert_eq(calls[0] + dropped, 20)
+  Camera::close(cam)
+  assert_eq(stub_marshal_live_events(), 0)
+  assert_eq(stub_live_closures(), 0)
+}
+
+///|
+test "marshal: full queue drops oldest (keep-latest) and reports drops" {
+  stub_reset()
+  let vm = stub_fake_vm()
+  let cam = Camera::open(vm, test_config("0", 320, 240, 2))
+  Camera::start_preview(cam)
+  let seen : Array[YuvFrame] = []
+  Camera::on_frame(cam, fn(f) { seen.push(f) })
+  for _ in 0..<13 { // 队列容量 8：13 = 8 在队 + 5 溢出
+    assert_eq(stub_produce(cam.reader), 0)
+  }
+  assert_eq(stub_marshal_pending(cam.reader), 8) // 有界
+  assert_eq(stub_marshal_dropped(cam.reader), 5) // 丢最旧 5 帧
+  assert_eq(Camera::pump_marshal(cam, 16), 8)
+  assert_eq(seen.length(), 8)
+  // keep-latest：保留最新 8 帧（k=5..12），FIFO 派发
+  check_frame(seen[0], 5, 320, 240, "drop-oldest first kept")
+  check_frame(seen[7], 12, 320, 240, "drop-oldest last kept")
+  for i in 1..<seen.length() {
+    assert_true(seen[i].timestamp_ns > seen[i - 1].timestamp_ns)
+  }
+  Camera::close(cam)
+  assert_eq(stub_marshal_live_events(), 0)
+}
+
+///|
+test "marshal: reentrant pump raises MarshalReentrant; outer pump completes" {
+  stub_reset()
+  let vm = stub_fake_vm()
+  let cam = Camera::open(vm, test_config("0", 320, 240, 2))
+  Camera::start_preview(cam)
+  let calls : Array[Int32] = [0]
+  let reentrant : Array[CameraError] = []
+  Camera::on_frame(cam, fn(_f) {
+    calls[0] = calls[0] + 1
+    if calls[0] == 1 {
+      // 回调内重入 pump：必须以 CameraError 拒绝，且不 panic
+      ignore(Camera::pump_marshal(cam, 8)) catch {
+        e => reentrant.push(e)
+      }
+    }
+  })
+  assert_eq(stub_produce(cam.reader), 0)
+  assert_eq(stub_produce(cam.reader), 0)
+  assert_eq(stub_produce(cam.reader), 0)
+  assert_eq(Camera::pump_marshal(cam, 8), 3) // 外层 pump 正常派发完
+  assert_eq(calls[0], 3)
+  assert_eq(reentrant.length(), 1) // 恰好拒绝一次，走 Error 枚举
+  assert_true(reentrant[0] is CameraError::MarshalReentrant(_))
+  Camera::close(cam)
+  assert_eq(stub_marshal_live_events(), 0)
+}
+
+///|
+test "marshal: clear/replace/grab inside callback are safe (deferred release)" {
+  stub_reset()
+  let vm = stub_fake_vm()
+  let cam = Camera::open(vm, test_config("0", 320, 240, 2))
+  Camera::start_preview(cam)
+  let first : Array[Int32] = [0]
+  let second : Array[Int32] = [0]
+  Camera::on_frame(cam, fn(_f) {
+    first[0] = first[0] + 1
+    // 回调内重入同步取帧（递归锁）：不 panic 且缓冲归还
+    ignore(Camera::grab_yuv(cam, 50)) catch {
+      _ => ()
+    }
+    // 回调内替换注册：旧闭包正在执行，RC 由派发前 incref 保护
+    Camera::on_frame(cam, fn(_g) { second[0] = second[0] + 1 }) catch {
+      _ => ()
+    }
+    // 回调内注销（新回调被清）：释放成对、不泄漏
+    Camera::clear_on_frame(cam) catch {
+      _ => ()
+    }
+  })
+  assert_eq(stub_produce(cam.reader), 0)
+  assert_eq(stub_produce(cam.reader), 0)
+  // 两事件均消费：第 1 个派发，第 2 个时注册已清 → 丢弃排水
+  assert_eq(Camera::pump_marshal(cam, 8), 2)
+  assert_eq(first[0], 1)
+  assert_eq(second[0], 0)
+  assert_eq(stub_live_closures(), 0) // 注销后无泄漏
+  assert_eq(stub_inflight(cam.reader), 0) // 回调内 grab 的缓冲已归还
+  Camera::close(cam)
+  assert_eq(stub_live_closures(), 0)
+  assert_eq(stub_marshal_live_events(), 0)
+}
+
+///|
+test "marshal: close inside callback defers teardown and rejects later ops" {
+  stub_reset()
+  let vm = stub_fake_vm()
+  let cam = Camera::open(vm, test_config("0", 320, 240, 2))
+  Camera::start_preview(cam)
+  let calls : Array[Int32] = [0]
+  Camera::on_frame(cam, fn(_f) {
+    calls[0] = calls[0] + 1
+    Camera::close(cam) // 回调内 close：结构体释放延迟到 pump 收尾
+     catch {
+      _ => ()
+    }
+  })
+  assert_eq(stub_produce(cam.reader), 0)
+  assert_eq(stub_produce(cam.reader), 0) // 第 2 事件派发前会话已死，不再触发
+  assert_eq(Camera::pump_marshal(cam, 8), 1) // 只消费 1 个（close 后停派发）
+  assert_eq(calls[0], 1)
+  // 延迟释放已在 pump 收尾完成：资源全部归零，无泄漏、无二次释放
+  assert_eq(stub_live_cameras(), 0)
+  assert_eq(stub_live_readers(), 0)
+  assert_eq(stub_live_closures(), 0)
+  assert_eq(stub_marshal_live_events(), 0)
+  // 后续操作一律 AlreadyClosed（不 panic）
+  let e1 = expect_camera_error(
+    () => Camera::grab_yuv(cam, 10) |> ignore,
+    "grab after in-callback close",
+  )
+  assert_true(e1 is CameraError::AlreadyClosed)
+  let e2 = expect_camera_error(() => Camera::close(cam), "repeated close")
+  assert_true(e2 is CameraError::AlreadyClosed)
+  let e3 = expect_camera_error(
+    () => Camera::pump_marshal(cam, 8) |> ignore,
+    "pump after close",
+  )
+  assert_true(e3 is CameraError::AlreadyClosed)
+}
+
+///|
+test "marshal: release after delivery frees queued events without dispatch" {
+  stub_reset()
+  let vm = stub_fake_vm()
+  let cam = Camera::open(vm, test_config("0", 320, 240, 2))
+  Camera::start_preview(cam)
+  let calls : Array[Int32] = [0]
+  Camera::on_frame(cam, fn(_f) { calls[0] = calls[0] + 1 })
+  assert_eq(stub_produce(cam.reader), 0)
+  assert_eq(stub_produce(cam.reader), 0)
+  assert_eq(stub_produce(cam.reader), 0)
+  assert_eq(stub_marshal_pending(cam.reader), 3) // 已投递未派发
+  Camera::close(cam) // 投递后直接释放：队列事件全部释放
+  assert_eq(calls[0], 0) // 从未派发
+  assert_eq(stub_marshal_live_events(), 0) // 无泄漏
+  assert_eq(stub_live_closures(), 0)
+  // 第二段：clear 后 pump 丢弃排水（不派发）
+  stub_reset()
+  let cam2 = Camera::open(vm, test_config("0", 320, 240, 2))
+  Camera::start_preview(cam2)
+  Camera::on_frame(cam2, fn(_f) { calls[0] = calls[0] + 1 })
+  assert_eq(stub_produce(cam2.reader), 0)
+  assert_eq(stub_produce(cam2.reader), 0)
+  Camera::clear_on_frame(cam2)
+  assert_eq(Camera::pump_marshal(cam2, 8), 2) // 事件被消费但丢弃（无回调）
+  assert_eq(calls[0], 0) // 注销后不触发
+  assert_eq(stub_marshal_pending(cam2.reader), 0)
+  Camera::close(cam2)
+  assert_eq(stub_marshal_live_events(), 0)
+}
+
+///|
+test "marshal: pump error paths map to CameraError; marshal_next misuse is non-panicking" {
+  stub_reset()
+  let vm = stub_fake_vm()
+  let cam = Camera::open(vm, test_config("0", 320, 240, 2))
+  Camera::start_preview(cam)
+  // max_events < 1：invalid arg 走 Error 枚举
+  let e1 = expect_camera_error(
+    () => Camera::pump_marshal(cam, 0) |> ignore,
+    "pump with max_events=0",
+  )
+  assert_true(e1 is CameraError::OpenFailed(-13, _))
+  let e2 = expect_camera_error(
+    () => Camera::pump_marshal(cam, -3) |> ignore,
+    "pump with negative max_events",
+  )
+  assert_true(e2 is CameraError::OpenFailed(-13, _))
+  // marshal_next 非派发期间误用：负数返回，不 panic（白盒直调）
+  let buf = FixedArray::make(64, b'\x00')
+  assert_true(mb_camera2_marshal_next(cam.reader, buf, 64) < 0)
+  // pump_error 映射覆盖
+  assert_true(pump_error(-15, "c") is CameraError::MarshalReentrant("c"))
+  assert_true(pump_error(-8, "c") is CameraError::JniThreadNotAttached("c"))
+  assert_true(pump_error(-1, "c") is CameraError::OpenFailed(-1, "c"))
+  // 空队列 pump：0 事件，不 panic
+  assert_eq(Camera::pump_marshal(cam, 8), 0)
+  Camera::close(cam)
+}
+
+///|
+test "marshal: out-of-order concurrent pushes dispatch in linearized FIFO order" {
+  stub_reset()
+  stub_set_threaded(1) // 投递线程
+  stub_set_frame_interval_ms(3)
+  let vm = stub_fake_vm()
+  let cam = Camera::open(vm, test_config("0", 320, 240, 2))
+  let seen : Array[YuvFrame] = []
+  Camera::on_frame(cam, fn(f) { seen.push(f) })
+  Camera::start_preview(cam)
+  // owner 线程也投递（与投递线程并发 push，乱序竞争入队）
+  for _ in 0..<10 {
+    assert_eq(stub_produce(cam.reader), 0)
+    ignore(Camera::pump_marshal(cam, 4))
+    stub_sleep(3)
+  }
+  stub_set_frame_count(0) // 停止一切再投递（确定性收尾）
+  stub_quiesce()
+  stub_sleep(10)
+  ignore(Camera::pump_marshal(cam, 16)) // 排空
+  assert_true(seen.length() >= 1)
+  // 并发乱序投递被锁串行化：派发顺序 = 线性化入队顺序（时间戳严格递增）
+  for i in 1..<seen.length() {
+    assert_true(seen[i].timestamp_ns > seen[i - 1].timestamp_ns)
+  }
+  // 全部事件有归属：派发 + 丢弃 == 入队
+  let pushed = stub_marshal_pushed(cam.reader)
+  let dropped = stub_marshal_dropped(cam.reader)
+  assert_true(pushed >= 10)
+  assert_eq(stub_marshal_pending(cam.reader), 0)
+  assert_eq(seen.length() + dropped, pushed)
+  Camera::close(cam)
+  assert_eq(stub_marshal_live_events(), 0)
 }

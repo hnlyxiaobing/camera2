@@ -5,8 +5,10 @@
 /// 0 ok、-1 failed、-2 permission、-3 not found、-4 unsupported size、
 /// -5 unsupported format、-6 acquire failed、-7 pool exhausted、
 /// -8 JNI thread not attached、-9 vendor quirk、-10 preview failed、
-/// -11 timeout、-12 capacity、-13 invalid arg、-14 already open。
-/// `mb_camera2_acquire_frame` 另约定：正数返回值 = 所需缓冲容量（不消费帧）。
+/// -11 timeout、-12 capacity、-13 invalid arg、-14 already open、
+/// -15 reentrant pump（marshal 层重入）。
+/// `mb_camera2_acquire_frame` / `mb_camera2_marshal_next` 另约定：
+/// 正数返回值 = 所需缓冲容量（不消费帧）。
 
 ///|
 /// 最近一次 C shim 调用的线程局部状态码（句柄类 shim 失败时判别错误类别）。
@@ -139,6 +141,20 @@ fn acquire_error(
       } else {
         CameraError::BufferAcquireFailed(status)
       }
+  }
+}
+
+///|
+/// pump_marshal 站点映射：-15 重入 → `MarshalReentrant`，
+/// 其余沿用无歧义映射，兜底 `OpenFailed(status, ctx)`。
+fn pump_error(status : Int32, ctx : String) -> CameraError {
+  if status == -15 {
+    CameraError::MarshalReentrant(ctx)
+  } else {
+    match map_unambiguous(status, ctx, 0, 0) {
+      Some(e) => e
+      None => CameraError::OpenFailed(status, ctx)
+    }
   }
 }
 
@@ -330,4 +346,29 @@ fn Camera::acquire_frame_value(
   let frame = parse_yuv_frame(buf, written)
   mb_camera2_release_frame(self.reader)
   frame
+}
+
+///|
+/// 从 marshal 暂存槽拉取一帧纯值（两段式：先探容量、再按需取走并解析）。
+/// 仅在 `pump_marshal` 派发期间有效（thunk 内调用）；无暂存事件、
+/// 误用（非派发期间）或解析失败一律返回 `None`，**绝不 panic**——
+/// 解析失败的事件已被消费，不会卡住队列。
+fn take_marshal_frame(reader : ImageReaderRaw) -> YuvFrame? {
+  try {
+    let probe = FixedArray::make(64, b'\x00')
+    let first = mb_camera2_marshal_next(reader, probe, 64)
+    if first <= 0 {
+      None
+    } else {
+      let buf = FixedArray::make(first, b'\x00')
+      let second = mb_camera2_marshal_next(reader, buf, first)
+      if second != 0 {
+        None
+      } else {
+        Some(parse_yuv_frame(buf, first))
+      }
+    }
+  } catch {
+    _ => None
+  }
 }

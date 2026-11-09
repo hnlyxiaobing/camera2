@@ -20,6 +20,7 @@ pub(all) suberror CameraError {
   BufferAcquireFailed(Int32)
   BufferPoolExhausted(Int32)
   JniThreadNotAttached(String)
+  MarshalReentrant(String)
   AlreadyOpen
   AlreadyClosed
   VendorQuirk(String)
@@ -39,6 +40,7 @@ pub fn Camera::close(Self) -> Unit raise CameraError
 pub fn Camera::grab_yuv(Self, Int32) -> YuvFrame raise CameraError
 pub fn Camera::on_frame(Self, (YuvFrame) -> Unit) -> Unit raise CameraError
 pub fn Camera::open(JavaVMPtr, CameraConfig) -> Self raise CameraError
+pub fn Camera::pump_marshal(Self, Int32) -> Int32 raise CameraError
 pub fn Camera::start_preview(Self) -> Unit raise CameraError
 
 pub(all) struct CameraConfig {

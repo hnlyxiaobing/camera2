@@ -7,12 +7,14 @@
 /// （ajni 在 Windows 主机 + 目标设备真机的可用性未实证）。
 ///
 /// 线程与所有权总则（JNI 硬约束，完整决策见 DECISIONS.md
-/// 「JNI 线程亲和性与回调所有权」）：
+/// 「JNI 线程亲和性与回调所有权」「回调投递线程 → owner 线程 marshal」）：
 /// - `JNIEnvPtr` 是线程局部的，禁止缓存、禁止跨线程传递；只缓存 `JavaVMPtr`。
 /// - 原生线程回调前必须 `AttachCurrentThread`，退出前 `DetachCurrentThread`。
 /// - 跨回调长期持有的 Java 对象必须用 `NewGlobalRef` / `DeleteGlobalRef` 管理。
-/// - 帧回调在相机投递线程触发，必须浅拷贝帧数据后 marshal 到 owner 线程，
-///   回调内禁止直接触碰 JNI session、禁止阻塞、禁止保存栈上指针。
+/// - 帧回调经 **marshal 层**（R4）投递：投递线程只浅拷贝帧数据入队
+///   （C 侧有界 marshal 队列），**绝不执行 MoonBit 闭包**；闭包只由
+///   owner 线程 `Camera::pump_marshal` 同步派发。回调内禁止直接触碰
+///   JNI session、禁止阻塞、禁止保存栈上指针。
 /// - `CameraHandleRaw` / `ImageReaderRaw` 为 C 侧 `void*`，由 `mb_camera2_close` 释放一次。
 /// 平台约束：仅 `native` 目标；Android API 24+（NDK camera2ndk）或 Java Camera2 + ajni。
 
@@ -110,6 +112,7 @@ pub(all) struct Camera {
 ///|
 /// 相机错误模型（**API 冻结前追认**：`pub(all) suberror`——
 /// 组合根可替换帧源需在包外构造/抛出，见 DECISIONS.md「可替换帧源设计」）。
+/// `MarshalReentrant`（R4）：派发期间重入 `Camera::pump_marshal` 被拒绝。
 #derive(Debug)
 pub(all) suberror CameraError {
   PermissionDenied(String)
@@ -121,6 +124,7 @@ pub(all) suberror CameraError {
   BufferAcquireFailed(Int32)
   BufferPoolExhausted(Int32)
   JniThreadNotAttached(String)
+  MarshalReentrant(String)
   AlreadyOpen
   AlreadyClosed
   VendorQuirk(String)
@@ -206,7 +210,8 @@ extern "C" fn mb_camera2_release_frame(reader : ImageReaderRaw) -> Unit = "mb_ca
 ///|
 /// 注册帧回调。`closure` 为 `#owned`：C 侧长期持有 MoonBit 闭包，
 /// 注销时须由 shim 执行 `moonbit_decref`；`cb` 为无捕获 `FuncRef` 适配器。
-/// 回调在相机投递线程触发，**不得**在其中直接使用 JNI session。
+/// **闭包只由 owner 线程 `mb_camera2_marshal_pump` 派发**（R4 marshal 层）；
+/// 投递线程只做浅拷贝入队，绝不执行闭包。
 #owned(closure)
 extern "C" fn mb_camera2_set_frame_callback(
   reader : ImageReaderRaw,
@@ -217,6 +222,25 @@ extern "C" fn mb_camera2_set_frame_callback(
 ///|
 /// 注销帧回调并释放 `#owned` 持有的闭包。
 extern "C" fn mb_camera2_clear_frame_callback(reader : ImageReaderRaw) -> Unit = "mb_camera2_clear_frame_callback"
+
+///|
+/// owner 线程 pump：同步派发 marshal 队列中已投递的帧事件（每事件恰好
+/// 调用一次已注册闭包；无注册回调时事件丢弃排水）。返回消费事件数；
+/// -15 = 派发期间重入（映射 `CameraError::MarshalReentrant`）。
+extern "C" fn mb_camera2_marshal_pump(
+  reader : ImageReaderRaw,
+  max_events : Int32,
+) -> Int32 = "mb_camera2_marshal_pump"
+
+///|
+/// 派发期间由被调闭包拉取暂存事件（两段式：容量不足返回所需容量不消费；
+/// 足够则拷贝并消费）。`#borrow(dst)`：MoonBit 保留缓冲所有权。
+#borrow(dst)
+extern "C" fn mb_camera2_marshal_next(
+  reader : ImageReaderRaw,
+  dst : FixedArray[Byte],
+  capacity : Int32,
+) -> Int32 = "mb_camera2_marshal_next"
 
 ///|
 /// 关闭并释放 reader + camera 句柄（C 侧唯一释放点，且只能调用一次；
@@ -331,15 +355,18 @@ pub fn Camera::grab_yuv(
 }
 
 ///|
-/// 注册帧回调。回调必须浅拷贝帧数据并 marshal 到 owner 线程，不得在回调内做 JNI 调用。
+/// 注册帧回调（**R4 marshal 语义**）：投递线程只把浅拷贝帧事件入 C 侧有界
+/// marshal 队列，**闭包不在投递线程执行**；须由 owner 线程调用
+/// `Camera::pump_marshal` 同步派发——每消费一个事件回调恰好执行一次。
 ///
 /// - 跨 C 边界拆为 `FuncRef` 无捕获适配器 + `#owned` 闭包二元组（回调所有权设计
 ///   见 DECISIONS.md「JNI 线程亲和性与回调所有权」）；
 ///   C 侧长期持有闭包，注销/替换/关闭时 `moonbit_decref`，成对不泄漏。
-/// - 每次投递时 thunk 同步取一帧（acquire→release，浅拷贝为纯值）再调用 `cb`；
-///   取帧失败则本次不调用 `cb`。
-/// - 回调在相机投递线程触发（stub 可从独立投递线程调用）；**回调内禁止直接
-///   使用 JNI session、禁止阻塞**，须自行 marshal 到 owner 线程。
+/// - 每次派发时 thunk 经 `mb_camera2_marshal_next` 拉取暂存帧事件、解析为纯值
+///   `YuvFrame` 再调用 `cb`；解析失败则本次不调用 `cb`（事件仍被消费，不卡队列）。
+/// - 回调内**禁止阻塞**、禁止长时间占用 owner 线程；可安全重入
+///   `grab_yuv` / `on_frame` / `clear_on_frame` / `close`（释放竞态由 C 侧
+///   延迟释放收敛），**不可**重入 `pump_marshal`（`MarshalReentrant`）。
 /// - 线程：注册须在 owner 线程；会话未存活拒绝操作。
 pub fn Camera::on_frame(
   self : Camera,
@@ -347,12 +374,11 @@ pub fn Camera::on_frame(
 ) -> Unit raise CameraError {
   ensure_session(self.handle, self.reader)
   ensure_owner(self.owner_thread_id)
+  let reader = self.reader
   let thunk : () -> Unit = fn() {
-    try {
-      let frame = Camera::acquire_frame_value(self, 0)
-      cb(frame)
-    } catch {
-      _ => ()
+    match take_marshal_frame(reader) {
+      Some(frame) => cb(frame)
+      None => ()
     }
   }
   let status = mb_camera2_set_frame_callback(self.reader, fn(f) { f() }, thunk)
@@ -364,6 +390,34 @@ pub fn Camera::on_frame(
       self.config.size.height,
     )
   }
+}
+
+///|
+/// owner 线程 pump：同步派发 marshal 队列中已投递的帧回调，返回本次消费的
+/// 事件数（每事件恰好调用一次已注册回调；无注册回调时事件丢弃排水）。
+///
+/// - 队列有界（C 侧满丢最旧并计数），出队顺序 = 线性化入队顺序；
+///   投递线程与 owner 线程的乱序并发投递在 C 侧锁内串行化。
+/// - 错误：会话未存活 `AlreadyClosed`；非 owner 线程 `JniThreadNotAttached`；
+///   派发期间重入 `MarshalReentrant`；`max_events < 1` 为 `OpenFailed(-13, _)`。
+/// - 线程：**只在 owner 线程调用**（与 JNI session 同线程，闭包同线程执行）。
+/// - 非目标：不阻塞等待新帧（纯排水语义，配合调用方循环/事件驱动使用）。
+pub fn Camera::pump_marshal(
+  self : Camera,
+  max_events : Int32,
+) -> Int32 raise CameraError {
+  ensure_session(self.handle, self.reader)
+  ensure_owner(self.owner_thread_id)
+  if max_events < 1 {
+    raise CameraError::OpenFailed(
+      -13, "Camera::pump_marshal: max_events must be >= 1",
+    )
+  }
+  let count = mb_camera2_marshal_pump(self.reader, max_events)
+  if count < 0 {
+    raise pump_error(count, "Camera::pump_marshal")
+  }
+  count
 }
 
 ///|
@@ -381,8 +435,13 @@ pub fn Camera::clear_on_frame(self : Camera) -> Unit raise CameraError {
 /// **不会二次释放，重复调用返回明确错误（`AlreadyClosed`）**——
 /// 已关闭（或未 open）的会话再调 `close` 由会话存活守卫直接拒绝，
 /// 不会再次触碰 `mb_camera2_close`。
+/// 线程：owner 线程（跨线程 close 拒绝为 `JniThreadNotAttached`，
+/// 杜绝 close 与 pump 派发的跨线程竞态）；派发期间（回调内）close
+/// 合法，结构体释放延迟到本次 pump 收尾（防 UAF）。close 后 marshal
+/// 队列中未派发事件全部释放、不再触发回调。
 pub fn Camera::close(self : Camera) -> Unit raise CameraError {
   ensure_session(self.handle, self.reader)
+  ensure_owner(self.owner_thread_id)
   mb_camera2_clear_frame_callback(self.reader)
   mb_camera2_close(self.handle, self.reader)
 }
