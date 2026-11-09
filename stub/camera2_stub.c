@@ -10,7 +10,16 @@
  *   - 帧回调二元组 (FuncRef + #owned closure)：保存、成对持有/释放，
  *     注销/替换/关闭时 moonbit_decref；每次调用前 moonbit_incref（callee 按
  *     owned 约定在作用域末 decref 一次）；
- *   - 回调可从独立投递线程触发（threaded 模式），模拟相机投递线程语义。
+ *   - **回调 marshal 层（R4，ADR-0009「线程与回调所有权」）**：投递线程
+ *     （threaded 模式的独立线程）**只做浅拷贝入队**——打包帧 malloc 副本入
+ *     有界 marshal 队列（满则丢最旧 + 计数），**绝不执行 MoonBit 闭包**；
+ *     闭包只由 owner 线程 `mb_camera2_marshal_pump` 同步派发（每事件一次）。
+ *     有回调注册时帧走 marshal 队列（模拟 ImageReader listener 消费），
+ *     不再入 pending；无回调注册时入 pending 供 acquire_frame 同步消费。
+ *     重入 pump 返回 -15；派发期间 close 延迟释放结构体（close_pending），
+ *     pump 收尾统一拆除；close 后队列事件全部释放、不再派发。
+ * 本文件实现的完整 C ABI 契约见 stub/camera2_abi.h（真实 JNI native-stub
+ * 将实现同一批符号，MoonBit 侧 extern 声明零改动）。
  *
  * C ABI（MoonBit native/C 后端，见 MoonBit FFI 文档）：
  *   Int -> int32_t, UInt64 -> uint64_t, Unit -> void,
@@ -35,13 +44,17 @@
  *   0 ok, -1 failed, -2 permission, -3 not found, -4 unsupported size,
  *   -5 unsupported format, -6 acquire failed, -7 pool exhausted,
  *   -8 JNI thread not attached, -9 vendor quirk, -10 preview failed,
- *   -11 timeout, -12 capacity too small, -13 invalid arg, -14 already open。
+ *   -11 timeout, -12 capacity too small, -13 invalid arg, -14 already open,
+ *   -15 reentrant pump（marshal 层）。
  * mb_camera2_acquire_frame 返回约定：0 成功；负数为状态码；正数为所需缓冲容量
  * （capacity 不足时不消费帧，调用方按返回值重试）。
+ * mb_camera2_marshal_next 返回约定同上（两段式；仅派发期间有效）。
  */
 #include "moonbit.h"
 
 #include <string.h>
+
+#include "camera2_abi.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -51,22 +64,7 @@
 #include <unistd.h>
 #endif
 
-/* ---------------- 状态码 ---------------- */
-#define ST_OK 0
-#define ST_FAILED (-1)
-#define ST_PERMISSION (-2)
-#define ST_NOT_FOUND (-3)
-#define ST_UNSUPPORTED_SIZE (-4)
-#define ST_UNSUPPORTED_FORMAT (-5)
-#define ST_ACQUIRE_FAILED (-6)
-#define ST_POOL_EXHAUSTED (-7)
-#define ST_NOT_ATTACHED (-8)
-#define ST_VENDOR_QUIRK (-9)
-#define ST_PREVIEW_FAILED (-10)
-#define ST_TIMEOUT (-11)
-#define ST_CAPACITY (-12)
-#define ST_INVALID_ARG (-13)
-#define ST_ALREADY_OPEN (-14)
+/* ---------------- 状态码 / shim 原型（见 camera2_abi.h） ---------------- */
 
 #define FRAME_HEADER_SIZE 64
 #define MAX_SESSIONS 64
@@ -153,6 +151,15 @@ typedef struct {
   int32_t max_buffers;
 } cam_t;
 
+/* marshal 事件：打包帧 malloc 副本 + 入队线性化序号（R4，ADR-0009） */
+typedef struct {
+  uint8_t *payload;
+  int32_t len;
+  int64_t seq;
+} marshal_ev_t;
+
+#define MAX_MARSHAL 8
+
 typedef struct {
   int32_t magic;
   cam_t *cam;
@@ -172,6 +179,18 @@ typedef struct {
   int32_t stop_thread;
   thread_handle_t thread;
   int32_t thread_started;
+  /* ---- 回调 marshal 层（R4） ---- */
+  marshal_ev_t mq[MAX_MARSHAL]; /* 有界 FIFO，满丢最旧 */
+  int32_t mq_head;
+  int32_t mq_len;
+  int64_t mq_seq;     /* 累计入队数（含丢弃），即线性化序号源 */
+  int32_t mq_dropped; /* 满队列丢弃计数（keep-latest） */
+  marshal_ev_t staged; /* 派发中暂存事件，由闭包经 marshal_next 拉取 */
+  int32_t staged_valid;
+  int32_t dispatch_depth; /* >0 = 正在派发（同线程重入 pump 以此拒绝） */
+  int32_t closed;         /* close 已逻辑判死（结构体可能延迟释放） */
+  int32_t close_pending;  /* 派发期间 close：结构体释放延迟到 pump 收尾 */
+  cam_t *close_cam;       /* 延迟释放的 cam */
 } reader_t;
 
 #define MAGIC_CAM 0x43414D32
@@ -182,6 +201,7 @@ static reader_t *g_readers[MAX_SESSIONS];
 static int32_t g_live_cams = 0;
 static int32_t g_live_readers = 0;
 static int32_t g_live_closures = 0;
+static int32_t g_marshal_live = 0; /* marshal 事件载荷存活数（泄漏观测） */
 
 /* ---------------- 全局配置 / 注入点 ---------------- */
 static void *g_vm = NULL;
@@ -309,24 +329,86 @@ static void fill_frame(uint8_t *out, const reader_t *r, int32_t k) {
   fill_plane(vp, c_rows, c_rs, 2, w / 2, k, 2);
 }
 
-/* ---------------- 回调分发（持递归锁调用） ---------------- */
-static void dispatch_locked(reader_t *r) {
-  void (*cb)(void *);
-  void *closure;
-  if (r->cb == NULL || r->closure == NULL) {
-    return;
+/* ---------------- 回调 marshal 队列（R4，ADR-0009） ----------------
+ * 投递线程只做浅拷贝入队（marshal_push_locked），绝不执行 MoonBit 闭包；
+ * 闭包由 owner 线程 mb_camera2_marshal_pump 派发（mb_camera2_marshal_next
+ * 拉取暂存事件）。所有队列操作持全局递归锁。 */
+
+static void free_marshal_ev(marshal_ev_t *ev) {
+  if (ev->payload != NULL) {
+    libc_free(ev->payload);
+    ev->payload = NULL;
+    ev->len = 0;
+    g_marshal_live--;
   }
-  cb = r->cb;
-  closure = r->closure;
-  /* owned 调用约定：callee 在作用域末 decref 一次，调用前须 incref。 */
-  moonbit_incref(closure);
-  r->callback_calls++;
-  g_dispatching++;
-  cb(closure);
-  g_dispatching--;
 }
 
-/* ---------------- 帧生产 ---------------- */
+static void drain_marshal_locked(reader_t *r) {
+  int32_t i;
+  free_marshal_ev(&r->staged);
+  r->staged_valid = 0;
+  for (i = 0; i < MAX_MARSHAL; i++) {
+    free_marshal_ev(&r->mq[i]);
+  }
+  r->mq_head = 0;
+  r->mq_len = 0;
+}
+
+/* 投递线程浅拷贝：打包帧 malloc 副本入有界 FIFO；满丢最旧（keep-latest）并计数。
+ * seq 在锁内单调分配，出队 FIFO 即线性化顺序（乱序并发投递被锁串行化）。 */
+static int32_t marshal_push_locked(reader_t *r, int32_t k) {
+  int32_t needed = frame_needed(r);
+  uint8_t *payload = (uint8_t *)libc_malloc((size_t)needed);
+  marshal_ev_t *slot;
+  if (payload == NULL) {
+    return ST_FAILED;
+  }
+  fill_frame(payload, r, k);
+  if (r->mq_len == MAX_MARSHAL) {
+    free_marshal_ev(&r->mq[r->mq_head]);
+    r->mq_head = (r->mq_head + 1) % MAX_MARSHAL;
+    r->mq_len--;
+    r->mq_dropped++;
+  }
+  slot = &r->mq[(r->mq_head + r->mq_len) % MAX_MARSHAL];
+  slot->payload = payload;
+  slot->len = needed;
+  slot->seq = r->mq_seq;
+  r->mq_seq++;
+  r->mq_len++;
+  g_marshal_live++;
+  return ST_OK;
+}
+
+/* 唯一结构体释放点：注销 + 排空 marshal 队列 + 释放 reader/cam。 */
+static void teardown_locked(reader_t *r, cam_t *cam) {
+  int32_t i;
+  if (r != NULL) {
+    for (i = 0; i < MAX_SESSIONS; i++) {
+      if (g_readers[i] == r) {
+        g_readers[i] = NULL;
+      }
+    }
+    g_live_readers--;
+    drain_marshal_locked(r);
+    r->magic = 0;
+    libc_free(r);
+  }
+  if (cam != NULL) {
+    for (i = 0; i < MAX_SESSIONS; i++) {
+      if (g_cams[i] == cam) {
+        g_cams[i] = NULL;
+      }
+    }
+    g_live_cams--;
+    cam->magic = 0;
+    libc_free(cam);
+  }
+}
+
+/* ---------------- 帧生产 ----------------
+ * dispatch=1 且已注册回调：帧走 marshal 队列（listener 消费语义，不入 pending）；
+ * 否则入 pending 供 acquire_frame 同步消费（确定性）。 */
 static int32_t produce_locked(reader_t *r, int32_t dispatch) {
   int32_t k;
   if (r->budget == 0) {
@@ -337,6 +419,9 @@ static int32_t produce_locked(reader_t *r, int32_t dispatch) {
   }
   k = (int32_t)r->produced;
   r->produced++;
+  if (dispatch && r->cb != NULL && r->closure != NULL) {
+    return marshal_push_locked(r, k);
+  }
   if (r->pending_len == MAX_PENDING) {
     /* 队列满：丢最旧（acquireLatest 语义） */
     r->pending_head = (r->pending_head + 1) % MAX_PENDING;
@@ -344,9 +429,6 @@ static int32_t produce_locked(reader_t *r, int32_t dispatch) {
   }
   r->pending[(r->pending_head + r->pending_len) % MAX_PENDING] = k;
   r->pending_len++;
-  if (dispatch) {
-    dispatch_locked(r);
-  }
   return ST_OK;
 }
 
@@ -358,7 +440,9 @@ static int32_t dequeue_locked(reader_t *r) {
   return k;
 }
 
-/* ---------------- 投递线程（threaded 模式） ---------------- */
+/* ---------------- 投递线程（threaded 模式） ----------------
+ * 模拟相机投递线程：只 produce（有回调注册时 = marshal 浅拷贝入队），
+ * 绝不执行 MoonBit 闭包（E1 线程安全缺口由 marshal 层绕开）。 */
 static thread_ret_t THREAD_CALL producer_main(void *arg) {
   reader_t *r = (reader_t *)arg;
   for (;;) {
@@ -754,18 +838,32 @@ void mb_camera2_close(void *camera, void *reader) {
   reader_t *r;
   cam_t *cam;
   void *old = NULL;
-  int32_t i;
+  int32_t defer = 0;
 
   lock();
   r = lookup_reader(reader);
   cam = lookup_cam(camera);
+  if (r != NULL && r->closed) {
+    /* 重复 close（C 层防御）：MoonBit 层 AlreadyClosed 守卫保证不到达这里 */
+    unlock();
+    return;
+  }
   if (r != NULL) {
     r->stop_thread = 1;
+    r->closed = 1; /* 逻辑判死：session_alive 即刻拒绝后续操作 */
     if (r->closure != NULL) {
       old = r->closure;
       r->cb = NULL;
       r->closure = NULL;
       g_live_closures--;
+    }
+    if (r->dispatch_depth > 0) {
+      /* 派发期间 close（回调内 close / 竞态）：结构体释放延迟到 pump 收尾，
+       * 防止闭包返回后 UAF；旧闭包的 decref 可立即执行——派发前的
+       * moonbit_incref 在整次调用期间持有引用（见 dispatch 增引用约定）。 */
+      r->close_pending = 1;
+      r->close_cam = cam;
+      defer = 1;
     }
   }
   unlock();
@@ -775,27 +873,16 @@ void mb_camera2_close(void *camera, void *reader) {
     join_thread(r);
   }
 
+  if (defer) {
+    /* 结构体释放移交给 mb_camera2_marshal_pump 收尾（teardown_locked） */
+    if (old != NULL) {
+      moonbit_decref(old);
+    }
+    return;
+  }
+
   lock();
-  if (r != NULL) {
-    for (i = 0; i < MAX_SESSIONS; i++) {
-      if (g_readers[i] == r) {
-        g_readers[i] = NULL;
-      }
-    }
-    g_live_readers--;
-    r->magic = 0;
-    libc_free(r);
-  }
-  if (cam != NULL) {
-    for (i = 0; i < MAX_SESSIONS; i++) {
-      if (g_cams[i] == cam) {
-        g_cams[i] = NULL;
-      }
-    }
-    g_live_cams--;
-    cam->magic = 0;
-    libc_free(cam);
-  }
+  teardown_locked(r, cam);
   unlock();
 
   if (old != NULL) {
@@ -818,7 +905,9 @@ uint64_t mb_camera2_current_thread_id(void) {
 int32_t mb_camera2_session_alive(void *camera, void *reader) {
   int32_t ok;
   lock();
-  ok = cam_registered(camera) && reader_registered(reader);
+  /* closed=1（含派发期间 close 的延迟释放窗口）即判死，不等结构体拆除 */
+  ok = cam_registered(camera) && reader_registered(reader) &&
+       !((reader_t *)reader)->closed;
   unlock();
   return ok ? 1 : 0;
 }
@@ -882,6 +971,127 @@ done:
   return st;
 }
 
+/* ================= 回调 marshal 层（R4，ADR-0009） ================= */
+
+/* owner 线程 pump：同步派发 marshal 队列中的帧回调。
+ * - 每事件恰好调用一次已注册二元组 (cb, closure)（owned 调用约定：调用前
+ *   moonbit_incref，callee 作用域末 decref）；无注册回调时事件丢弃排水。
+ * - 派发期间释放全局锁（回调可安全重入 acquire / set / clear / close）；
+ *   重入 pump 由 dispatch_depth 拒绝（-15 → CameraError::MarshalReentrant）。
+ * - 派发期间 close：结构体延迟释放（close_pending），收尾统一 teardown。
+ * - thunk 未消费暂存事件（异常路径）时强制丢弃，保证队列前进。
+ * 返回：消费事件数（≥0）；负数为状态码。 */
+int32_t mb_camera2_marshal_pump(void *reader, int32_t max_events) {
+  reader_t *r;
+  int32_t count = 0;
+
+  if (max_events < 1) {
+    set_status(ST_INVALID_ARG);
+    return ST_INVALID_ARG;
+  }
+  lock();
+  r = lookup_reader(reader);
+  if (r == NULL) {
+    set_status(ST_FAILED);
+    unlock();
+    return ST_FAILED;
+  }
+  if (r->dispatch_depth > 0) {
+    set_status(ST_REENTRANT);
+    unlock();
+    return ST_REENTRANT;
+  }
+  for (;;) {
+    void (*cb)(void *);
+    void *closure;
+    if (count >= max_events || r->closed) {
+      break;
+    }
+    if (!r->staged_valid) {
+      if (r->mq_len == 0) {
+        break;
+      }
+      r->staged = r->mq[r->mq_head];
+      r->mq[r->mq_head].payload = NULL;
+      r->mq_head = (r->mq_head + 1) % MAX_MARSHAL;
+      r->mq_len--;
+      r->staged_valid = 1;
+    }
+    cb = r->cb;
+    closure = r->closure;
+    if (cb == NULL || closure == NULL) {
+      /* 无注册回调：事件直接丢弃（队列始终有界排水） */
+      free_marshal_ev(&r->staged);
+      r->staged_valid = 0;
+    } else {
+      /* owned 调用约定：callee 在作用域末 decref 一次，调用前须 incref。 */
+      moonbit_incref(closure);
+      r->dispatch_depth++;
+      r->callback_calls++;
+      g_dispatching++;
+      unlock();
+      cb(closure);
+      lock();
+      g_dispatching--;
+      r->dispatch_depth--;
+      if (r->staged_valid) {
+        free_marshal_ev(&r->staged);
+        r->staged_valid = 0;
+      }
+    }
+    count++;
+  }
+  if (r->close_pending && r->dispatch_depth == 0) {
+    /* 回调内 close 的延迟释放：pump 返回前统一拆除（唯一释放点） */
+    cam_t *cam = r->close_cam;
+    r->close_pending = 0;
+    teardown_locked(r, cam);
+    r = NULL;
+  }
+  set_status(ST_OK);
+  unlock();
+  return count;
+}
+
+/* 派发期间由被调闭包拉取暂存事件（两段式，与 acquire_frame 约定一致）：
+ * - capacity 不足：返回所需容量，不消费暂存事件；
+ * - 足够：拷贝载荷、消费暂存事件，返回 0；
+ * - 负数：-13 非派发期间误用 / -1 无暂存事件。 */
+int32_t mb_camera2_marshal_next(void *reader, uint8_t *dst, int32_t capacity) {
+  reader_t *r;
+  int32_t needed;
+
+  lock();
+  r = lookup_reader(reader);
+  if (r == NULL) {
+    set_status(ST_FAILED);
+    unlock();
+    return ST_FAILED;
+  }
+  if (r->dispatch_depth == 0) {
+    set_status(ST_INVALID_ARG);
+    unlock();
+    return ST_INVALID_ARG;
+  }
+  if (!r->staged_valid) {
+    set_status(ST_FAILED);
+    unlock();
+    return ST_FAILED;
+  }
+  needed = r->staged.len;
+  if (capacity < needed) {
+    set_status(ST_OK);
+    unlock();
+    return needed;
+  }
+  memcpy(dst, r->staged.payload, (size_t)needed);
+  free_marshal_ev(&r->staged);
+  r->staged_valid = 0;
+  set_status(ST_OK);
+  unlock();
+  return 0;
+}
+
 /* ================= 桌面 stub 测试替身控制 ================= */
 
 void mb_camera2_stub_reset(void) {
@@ -895,6 +1105,7 @@ void mb_camera2_stub_reset(void) {
           moonbit_decref(g_readers[i]->closure);
           g_live_closures--;
         }
+        drain_marshal_locked(g_readers[i]);
         libc_free(g_readers[i]);
       }
       g_readers[i] = NULL;
@@ -1056,4 +1267,43 @@ void mb_camera2_stub_quiesce(void) {
     }
     sleep_ms(1);
   }
+}
+
+/* marshal 队列观测（测试替身，非真实 ABI） */
+int32_t mb_camera2_stub_marshal_pending(void *reader) {
+  reader_t *r;
+  int32_t n;
+  lock();
+  r = lookup_reader(reader);
+  n = (r != NULL) ? (r->mq_len + (r->staged_valid ? 1 : 0)) : -1;
+  unlock();
+  return n;
+}
+
+int32_t mb_camera2_stub_marshal_dropped(void *reader) {
+  reader_t *r;
+  int32_t n;
+  lock();
+  r = lookup_reader(reader);
+  n = (r != NULL) ? r->mq_dropped : -1;
+  unlock();
+  return n;
+}
+
+int32_t mb_camera2_stub_marshal_pushed(void *reader) {
+  reader_t *r;
+  int32_t n;
+  lock();
+  r = lookup_reader(reader);
+  n = (r != NULL) ? (int32_t)r->mq_seq : -1;
+  unlock();
+  return n;
+}
+
+int32_t mb_camera2_stub_marshal_live_events(void) {
+  int32_t n;
+  lock();
+  n = g_marshal_live;
+  unlock();
+  return n;
 }
