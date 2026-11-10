@@ -1013,3 +1013,23 @@ test "marshal: out-of-order concurrent pushes dispatch in linearized FIFO order"
   Camera::close(cam)
   assert_eq(stub_marshal_live_events(), 0)
 }
+
+///|
+/// set_frame_callback 失败路径不得泄漏 #owned 闭包（P1 回归）。
+test "on_frame failure path releases owned closure" {
+  stub_reset()
+  let vm = stub_fake_vm()
+  let cam = Camera::open(vm, test_config("0", 320, 240, 2))
+  Camera::start_preview(cam)
+  assert_eq(stub_live_closures(), 0)
+  stub_set_unattached(1)
+  let e = expect_camera_error(
+    () => Camera::on_frame(cam, fn(_) { () }),
+    "unattached on_frame",
+  )
+  assert_true(e is CameraError::JniThreadNotAttached(_))
+  assert_eq(stub_live_closures(), 0) // 失败路径已 decref，无泄漏
+  stub_set_unattached(0)
+  Camera::close(cam)
+  assert_eq(stub_live_closures(), 0)
+}

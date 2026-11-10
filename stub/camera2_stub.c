@@ -589,6 +589,10 @@ void *mb_camera2_open(uint8_t *camera_id, int32_t width, int32_t height,
     goto done;
   }
   cam = (cam_t *)libc_malloc(sizeof(cam_t));
+  if (cam == NULL) {
+    st = ST_FAILED;
+    goto done;
+  }
   memset(cam, 0, sizeof(cam_t));
   cam->magic = MAGIC_CAM;
   memcpy(cam->id, id, strlen(id) + 1);
@@ -642,6 +646,10 @@ void *mb_camera2_create_reader(void *camera, int32_t width, int32_t height,
     goto done;
   }
   r = (reader_t *)libc_malloc(sizeof(reader_t));
+  if (r == NULL) {
+    st = ST_FAILED;
+    goto done;
+  }
   memset(r, 0, sizeof(reader_t));
   r->magic = MAGIC_RD;
   r->cam = cam;
@@ -810,6 +818,9 @@ int32_t mb_camera2_set_frame_callback(void *reader, void (*cb)(void *),
   return ST_OK;
 
 done:
+  if (st != ST_OK && closure != NULL) {
+    moonbit_decref(closure);
+  }
   set_status(st);
   unlock();
   return st;
@@ -1024,8 +1035,8 @@ int32_t mb_camera2_marshal_pump(void *reader, int32_t max_events) {
       free_marshal_ev(&r->staged);
       r->staged_valid = 0;
     } else {
-      /* owned 调用约定：callee 在作用域末 decref 一次，调用前须 incref。 */
-      moonbit_incref(closure);
+      /* borrow 调用约定（与 frida_gum_ffi 对齐，moon 0.1.20261104 实测）：
+       * cb(closure) 不消费引用；#owned 的唯一释放点在 clear/close 的 decref。 */
       r->dispatch_depth++;
       r->callback_calls++;
       g_dispatching++;
