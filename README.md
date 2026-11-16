@@ -1,63 +1,68 @@
-# hnlyxiaobing/camera2
+# camera2 · Camera2 JNI 取帧
 
-**Android Camera2 的 JNI 封装 —— 权限、打开、预览 Surface、ImageReader 取 YUV 与关闭的完整相机生命周期。**
+> 独立发布单元 ｜ L3 感知绑定 ｜ `preferred_target = native` ｜ Apache-2.0
+> 状态：`moon test` **31/31** 通过（2026-11-11 本机实测）；本文件是本仓库**唯一**说明文档。
+> 公开 API 以 `pkg.generated.mbti` 为准（由 `moon info` 生成，禁手工编辑）；加法性变更须登记簿记 + 快照审阅 + 快照门禁。
 
-> 状态：**实现完成（2026-11-07，桌面 stub 阶段）+ R4 E1 回调 marshal 层（2026-11-09）**。全部导出接口已实现，`moon build` / `moon test` 全绿（**30 测试**，`0068` 清零）。本阶段自带**桌面 C stub**（`stub/camera2_stub.c`）模拟 JavaVM/ImageReader/相机会话；**真实 JNI / Java 样板 / ajni / 设备取帧留待后续真实对接阶段**（ajni 在 Windows 主机 + 目标设备真机的可用性未实证，见「风险与待验证」）。
-> **R4 E1（回调线程安全）**：帧回调投递线程**不再直接执行 MoonBit 闭包**——改为「投递线程浅拷贝入 C 侧有界 marshal 队列 → owner 线程 `Camera::pump_marshal` 同步派发」（本仓库回调 marshal 决策）。重入 pump 返回 `MarshalReentrant`；关闭竞态由 C 侧延迟释放收敛。并发/重入/满队列/关闭竞态白盒测试已绿；**Linux pthread 原实验（无捕获 FuncRef / `#owned` 闭包反复调用）在本机 Windows 无法执行，仍 [仍需实测]**（最小实验方案见 `docs/DESIGN.md` §14）。
-> **API 冻结前整改已落实**：`FrameSource` 方法集冻结（`grab_yuv(Self)`，trait 层无超时参数，超时策略由具体帧源实现自行定义）· `CameraError` 追认 `pub(all) suberror` · `CameraState` 收紧为 `Open` 单分支 · 9 个 `mb_camera2_*` shim 移出公开 API（包私有，私有实现 ABI）· `close` 幂等措辞统一为「不会二次释放，重复调用返回明确错误」。门禁 `moon clean` / `moon check --deny-warn` / `moon build` / `moon test` / `moon fmt --check` 全绿。
-> `preferred_target` 已由 `wasm` 改为 `native`（唯一配置改动，理由见 `docs/DECISIONS.md`「preferred_target 由 wasm 改为 native」）。
+## 1. 定位与边界
 
-## 定位与为什么存在
+把 Android Camera2 的帧封装成可替换的 `YuvFrame`，并把回调安全送回 owner 线程。
 
-生态检索复核（2026-11-06）：`camera2` 命中全为 2D 游戏相机误报。Camera2 是平台 Java API（NDK camera2ndk 需 API 24+），2026-11-06 检索 mooncakes.io 无 Android 取帧绑定（`justjavac/camera@0.1.3`(MIT) 是桌面 native 摄像头发现，不能替代 Android 取帧），故走 **FFI-JNI 封装**。本库是感知闭环的**可替换帧源**，产出中性 `YuvFrame`。
+**能力**
 
-**关键设计（JNI 线程亲和性与回调所有权，完整决策见 `docs/DECISIONS.md`）**：JNI 线程亲和性决定 `JNIEnv*` 绝不进入 MoonBit 值类型；`JavaVM*` 只在 C 侧缓存；帧回调在相机投递线程触发，必须 marshal 到 owner 线程；`FuncRef` 只能无捕获，回调状态（global ref / attach 状态）下沉到 C shim。因此「胶水 C 文件极薄」的说法应修正为「**薄在 ABI 转发，厚在生命周期与线程编排**」。
+- `Camera::{open,start_preview,grab_yuv,on_frame,clear_on_frame,pump_marshal,close}` 与 `enumerate_cameras`
+- 15 个包私有 `mb_camera2_*` C shim（9 核心 + 2 marshal + 4 internal），桌面 native-stub 可全链路测试
+- E1 回调 marshal 层：投递线程浅拷贝入有界队列（容量 8，keep-latest），owner 线程 `pump_marshal` 派发，重入抛 `MarshalReentrant`
+- `FrameSource` 契约冻结，`CameraState` 收紧为单分支 `Open`，`close` 幂等
 
-## 能力范围 / 非目标
+**非目标**
 
-- **做**：进程级 JNI 初始化、相机打开、ImageReader(YUV_420_888) 创建、重复预览请求、同步取帧、帧回调注册/注销、缓冲归还、关闭释放、相机能力枚举。
-- **不做**：推理、渲染、YUV→RGB 转换、权限 UI、Camera2 厂商 quirk 自动修复、视频编码、Surface 渲染。
-- 相机是**可替换帧源**：`pose` / `yuv` 不依赖本库，组合根可换成本地图片 / RTSP / 桌面摄像头（见 `docs/DECISIONS.md`「可替换帧源设计（FrameSource trait）」）。
+- 不执行真实 JNI 调用（当前为桌面 stub）；不引入 `ajni@0.3.6` / `justjavac/camera`
+- 不做 Camera1 / UVC 回退；不感知 `yuv` / `pose` 类型
 
-## 公开接口（速览）
+## 2. 关键设计决策（本仓库自足记录）
 
-`Camera::{open, start_preview, grab_yuv, on_frame, clear_on_frame, pump_marshal, close}`、`enumerate_cameras`。外部句柄与 shim 清单见 `docs/API.md`。
+- 只缓存 `JavaVM*` 不缓存 `JNIEnv*`（线程局部）；`FuncRef` 只接受无捕获闭包，`#owned` 闭包在 detach/close 成对 decref。
+- 被钩/投递线程**从不**执行 MoonBit 闭包，这是设计不变量而非待验证假设。
+- `preferred_target = native`（`extern "C"` 在 wasm 后端不受支持）。
+- 相机是可替换帧源，不是 `pose` 的前置条件。
 
-## 依赖
+## 3. 公开 API 索引（自动抽取 `pkg.generated.mbti` 的 `pub` 声明行；完整字段见快照）
 
-- **零外部依赖**；独立 `moon.mod`，`moon check --deny-warn` 独立通过。shim 实现仅为**项目内** `stub/camera2_stub.c` 桌面 stub（9 个 `mb_camera2_*` 为包私有 ABI，非公共 API），**未链接/下载任何外部库**。
-- 后续阶段：`Nanaloveyuki/ajni@0.3.6`（Apache-2.0，双向 checked JNI + Android host bridge）、Java 侧约 200 行 Camera2 样板、真实 `native-stub` C 文件。**均未引入**——`ajni` 为 0.x 且作者自述 "Windows/macOS desktop ABI support is not claimed"，需按依赖门槛（用途/许可/维护/平台/风险）评估后再引入（见 `docs/DECISIONS.md`「ajni 只作设计参照，真实 JNI 样板排后」）。
+```text
+pub fn enumerate_cameras(JavaVMPtr) -> Array[CameraInfo] raise CameraError
+pub(all) suberror CameraError {
+pub(all) struct Camera {
+pub fn Camera::clear_on_frame(Self) -> Unit raise CameraError
+pub fn Camera::close(Self) -> Unit raise CameraError
+pub fn Camera::grab_yuv(Self, Int32) -> YuvFrame raise CameraError
+pub fn Camera::on_frame(Self, (YuvFrame) -> Unit) -> Unit raise CameraError
+pub fn Camera::open(JavaVMPtr, CameraConfig) -> Self raise CameraError
+pub fn Camera::pump_marshal(Self, Int32) -> Int32 raise CameraError
+pub fn Camera::start_preview(Self) -> Unit raise CameraError
+pub(all) struct CameraConfig {
+pub(all) struct CameraInfo {
+pub(all) enum CameraState {
+pub(all) enum Facing {
+pub(all) struct FrameSize {
+pub(all) struct YuvFrame {
+pub(all) struct YuvPlane {
+pub(open) trait FrameSource {
+```
 
-## 风险与待验证
+## 4. 依赖、平台与许可
 
-- 平台：`preferred_target = "native"`；Android API 24+（NDK camera2ndk）或 Java Camera2 + ajni。
-- 许可：本仓库 Apache-2.0；`ajni` Apache-2.0；Android SDK / NDK 二进制**不可再分发**（SDK License 3.4）。
-- 风险：各厂商 Camera2 实现差异（部分 TV 只有 Camera1/UVC）；权限与后台限制；ImageReader 缓冲池耗尽；`AIMAGE_FORMAT_YUV_420_888` 三平面必须按 `row_stride`/`pixel_stride` 读取，不能假设紧凑布局。
-- `[待验证假设]` **ajni 真机可用性**：ajni 在 Windows 主机 + 目标设备真机（红米电视 Android 9 / armeabi-v7a）未实证（作者仅对部分平台实证，桌面 ABI 不承诺）。
-- `[待验证假设]` **回调线程安全**：相机投递线程执行 MoonBit 闭包的线程安全（GC、引用计数、重入）——**R4 已消除「投递线程直接执行闭包」路径**（marshal 到 owner 线程，本地并发测试绿）；但 Linux pthread 实测（E1 原实验）仍 [仍需实测]。
-- `[待验证假设]` **Camera1/UVC 回退必要性**：部分 TV 设备只有 Camera1，是否需要 Camera1/UVC 回退未实测；Camera2 厂商差异范围待一次能力探测确认。
+零第三方依赖（仅 core + `native-stub: stub/camera2_stub.c`）；`preferred_target = native`；Apache-2.0；Android SDK License 3.4 不可再分发。
 
-## 测试与验收
+## 5. 命令行与验证
 
-- **测试策略**：设备取 720p YUV 帧；缓冲池耗尽 / 超时注入；回调线程归属断言（不得在回调内直接 JNI）；权限拒绝 / 设备不存在 / 尺寸不支持路径；`moon test --enable-coverage`。
-- **验收标准**（实现阶段）：在红米电视与外接 UVC 摄像头上取到 720p YUV 帧；`close` **不会二次释放，重复调用返回明确错误（`AlreadyClosed`）**；每帧都被归还。
-- **桌面 stub 实测（2026-11-09）**：`moon build` ✅ / `moon test` ✅ **30/30**（全链路、状态机、池耗尽、回调 set/clear 成对、stride 描述、错误映射、解析校验、marshal 并发/重入/满队列/关闭竞态）；设备取帧验收留待真实对接阶段。
+- 本库无独立 CLI；`cmd/main` 为冒烟全链路示例。
+- 复验：`moon clean` → `moon check --deny-warn` → `moon build` → `moon test` → `moon fmt --check` → `moon info` 后检查 `pkg.generated.mbti` 无意外 diff。
+- 本仓库为独立 Git 仓库，文档与 CI 均自包含，不依赖工作区其他目录。
 
-## 当前状态 / 已有产物
+## 6. 风险与未决
 
-| 项 | 状态 |
-|---|---|
-| `camera2.mbt` + `internal.mbt`：5 个 `#external` 句柄、9 个**包私有** `extern "C"` shim（私有实现 ABI，非公共 API）、公开 API ×7 全部实现（状态守卫 / 错误映射 / YUV 校验） | ✅ |
-| `stub/camera2_stub.c` 桌面 stub（假设备枚举、可配置帧序列、缓冲池、`#owned` 闭包成对持有/释放、**有界 marshal 事件队列 + 延迟释放**；19 个测试替身可注入池耗尽/超时/线程错配） | ✅ |
-| `camera2_wbtest.mbt` / `camera2_test.mbt` 测试 ×30（黑盒不直接调用 shim；含 marshal 并发/重入/关闭竞态） | ✅ |
-| `pkg.generated.mbti` API 快照（工具链在 `moon check` / `moon build` 时自动同步至整改后公开面：9 个 shim 移除、`CameraState` 收紧为 `Open`） | ✅ |
-| `moon clean` / `moon check --deny-warn` / `moon build` / `moon test` / `moon fmt --check` | ✅ 全绿（0068 清零） |
-| Java Camera2 样板 / 真实 JNI / ajni 依赖 / 设备取帧 | ❌ 未做（排后续真实对接阶段；ajni 真机可用性未实证） |
+- E1 原始 Linux pthread 直调实验在本机 Windows 未实测；本地已用并发/重入/关闭竞态白盒测试替代其设计目的。
+- E4：`ajni` 在目标设备的 JNI 真机调用尚未实证；Q9（Camera1/UVC 回退必要性）未探测。
+- `camera2::YuvFrame` 无 `format` 字段、`yuv::YuvFrame` 有，组合根须显式选 `Yuv420888`。
 
-## 开发顺序说明
-
-`camera2` 不排在感知链的最前：最小验证场景（本地图片 + Mock 后端）不需要真实相机即可在桌面验证上层；相机是可替换帧源，不是 `pose` 的前置（见 `docs/DECISIONS.md`「开发排序：相机不是姿态门面的前置」）。
-
-## 文档索引
-
-`docs/DESIGN.md`（设计契约）· `docs/API.md`（公开 API 与内部 ABI）· `docs/DECISIONS.md`（设计决策记录：线程与所有权 / native 目标 / 可替换帧源 / 依赖门槛）
