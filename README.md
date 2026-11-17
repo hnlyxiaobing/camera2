@@ -63,6 +63,6 @@ pub(open) trait FrameSource {
 ## 6. 风险与未决
 
 - E1 原始 Linux pthread 直调实验在本机 Windows 未实测；本地已用并发/重入/关闭竞态白盒测试替代其设计目的。
-- E4：`ajni` 在目标设备的 JNI 真机调用尚未实证；Q9（Camera1/UVC 回退必要性）未探测。
+- E4：真实对接尚未实证；已裁决（2026-11-16，见 `docs/2026-11-16-camera2-benchmark-dev-plan.md` W7）：首选纯 C camera2ndk 同符号替换（零新依赖），`ajni` 仅作条件备选。Q9 已裁决：无需 Camera1/UVC 回退——Camera1 永久非目标（API 21 起弃用，LEGACY 仍由 Camera2 服务）；UVC 在 Camera2 EXTERNAL 语义之内（AOSP External Camera Provider，API 28+），设备启用性是真实对接前置探测项。
 - `camera2::YuvFrame` 无 `format` 字段、`yuv::YuvFrame` 有，组合根须显式选 `Yuv420888`。
 
